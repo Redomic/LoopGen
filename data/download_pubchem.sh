@@ -1,36 +1,44 @@
 #!/bin/bash
 
 # =============================================================================
-# PubChem SMILES Download Script
+# PubChem SMILES/SELFIES Download & Processing Script
 # =============================================================================
-# Robust bash wrapper for downloading and processing PubChem compound data
-# with resumable downloads, progress tracking, and comprehensive error handling
+#
+# Robust bash wrapper for the Python data preparation pipeline.
+# Features:
+#   - Advanced command-line interface
+#   - Resumable downloads via state management
+#   - Process control (status checks, killing jobs)
+#   - Dependency checks
+#
 # =============================================================================
 
 set -euo pipefail  # Exit on error, undefined vars, pipe failures
 
-# Configuration
+# --- Configuration ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_SCRIPT="$SCRIPT_DIR/prepare_data.py"
 LOG_DIR="$SCRIPT_DIR/logs"
+
+# State and Logging
 STATE_FILE="$LOG_DIR/download_state.json"
-PROGRESS_FILE="$LOG_DIR/download_progress.log"
+PROGRESS_LOG="$LOG_DIR/download_progress.log"
 ERROR_LOG="$LOG_DIR/download_errors.log"
 
-# Default values
-DEFAULT_LIMIT=10000000
-DEFAULT_OUTPUT="training.txt"
-DEFAULT_DATA_DIR="data"
-DEFAULT_CACHE_SUBDIR="cache"
-DEFAULT_OUTPUT_SUBDIR="output"
-DEFAULT_MAX_FILES=""
-DEFAULT_CLEANUP=false
-DEFAULT_RESUME=true
-DEFAULT_CONVERT_TO_SELFIES=true
-DEFAULT_SELFIES_OUTPUT=""
+# Default Parameters
+LIMIT=10000000
+OUTPUT_SMILES="training.txt"
+DATA_DIR="data"
+MAX_FILES=""
+CLEANUP=false
+RESUME=true
+CONVERT_TO_SELFIES=true
+OUTPUT_SELFIES=""
 DEBUG_MODE=false
+DOWNLOAD_METHOD="usearch"
+WORKERS=$(nproc --all 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
-# Colors for output
+# --- UI Colors ---
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -39,138 +47,125 @@ PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
-# Progress tracking
-TOTAL_DOWNLOADED=0
-TOTAL_PROCESSED=0
+# --- Global State ---
 TOTAL_SMILES=0
 START_TIME=$(date +%s)
 
 # =============================================================================
-# Utility Functions
+# Logging and Utility Functions
 # =============================================================================
 
 log_info() {
-    echo -e "${BLUE}[INFO]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$PROGRESS_FILE"
+    echo -e "${BLUE}[INFO]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$PROGRESS_LOG"
 }
 
 log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$PROGRESS_FILE"
+    echo -e "${YELLOW}[WARN]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$PROGRESS_LOG"
 }
 
 log_error() {
-    echo -e "${RED}[ERROR]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$ERROR_LOG"
+    echo -e "${RED}[ERROR]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$PROGRESS_LOG" | tee -a "$ERROR_LOG"
 }
 
 log_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$PROGRESS_FILE"
+    echo -e "${GREEN}[SUCCESS]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$PROGRESS_LOG"
 }
 
 show_banner() {
     echo -e "${CYAN}"
     echo "╔══════════════════════════════════════════════════════════════════════════════╗"
-    echo "║                      PubChem SMILES/SELFIES Downloader                      ║"
-    echo "║                        Modern ML-Ready Chemical Datasets                    ║"
+    echo "║                PubChem SMILES/SELFIES Data Preparation Pipeline              ║"
     echo "╚══════════════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
-    echo -e "${BLUE}Features: Multi-threaded downloads • Progress tracking • SELFIES conversion${NC}"
-    echo -e "${BLUE}Default: $(printf "%'d" $DEFAULT_LIMIT) molecules → training.txt + training_selfies.txt${NC}"
+    echo -e "${BLUE}Features: Multi-threaded processing • Progress tracking • SELFIES conversion${NC}"
+    echo -e "${BLUE}Default: $(printf "%'d" $LIMIT) molecules → $OUTPUT_SMILES + ${OUTPUT_SMILES%.*}_selfies.txt${NC}"
     echo ""
 }
 
 show_usage() {
-    echo -e "${CYAN}PubChem SMILES/SELFIES Downloader${NC}"
-    echo "Usage: $0 [OPTIONS]"
-    echo ""
-    echo -e "${GREEN}Basic Options:${NC}"
-    echo "  -l, --limit LIMIT        Number of SMILES to collect (default: $(printf "%'d" $DEFAULT_LIMIT))"
-    echo "  -o, --output OUTPUT      Output filename (default: $DEFAULT_OUTPUT)"
-    echo "  -d, --data-dir DIR       Data directory (default: $DEFAULT_DATA_DIR)"
-    echo ""
-    echo -e "${GREEN}Advanced Options:${NC}"
-    echo "  -c, --cache-subdir DIR   Cache subdirectory (default: $DEFAULT_CACHE_SUBDIR)"
-    echo "  -u, --output-subdir DIR  Output subdirectory (default: $DEFAULT_OUTPUT_SUBDIR)"
-    echo "  -m, --max-files NUM      Maximum files to process (default: all available)"
-    echo ""
-    echo -e "${GREEN}Conversion Options:${NC}"
-    echo "  -N, --no-convert         Disable SELFIES conversion (enabled by default)"
-    echo "  -f, --selfies-output     SELFIES output filename (auto-generated if not specified)"
-    echo ""
-    echo -e "${GREEN}Process Control:${NC}"
-    echo "  -r, --resume             Resume previous download (default: enabled)"
-    echo "  -R, --no-resume          Start fresh download, ignore previous state"
-    echo "  -C, --cleanup            Clean up cache after completion"
-    echo "  -s, --status             Show current download status"
-    echo "  -k, --kill               Kill running download process"
-    echo "  --debug              Enable debug mode (more verbose logging)"
-    echo "  -h, --help               Show this help message"
-    echo ""
-    echo -e "${YELLOW}Examples:${NC}"
-    echo "  $0                           # Download 10M molecules, convert to SELFIES"
-    echo "  $0 -l 5000000               # Download 5M molecules with SELFIES"
-    echo "  $0 -N                       # Download SMILES only (no SELFIES conversion)"
-    echo "  $0 -m 5 -l 100000           # Test run: 5 files, 100K molecules"
-    echo "  $0 -f my_dataset.txt        # Custom SELFIES filename"
-    echo "  $0 -s                       # Check current download status"
-    echo "  $0 -k                       # Stop running download"
-    echo ""
-    echo -e "${BLUE}Note: SELFIES conversion is enabled by default for modern ML workflows${NC}"
+    cat <<EOF
+${CYAN}PubChem SMILES/SELFIES Downloader & Processor${NC}
+Usage: $0 [OPTIONS]
+
+${GREEN}Basic Options:${NC}
+  -l, --limit LIMIT        Number of SMILES to collect (default: $(printf "%'d" $LIMIT))
+  -o, --output OUTPUT      Output filename for SMILES (default: $OUTPUT_SMILES)
+  -d, --data-dir DIR       Main data directory (default: $DATA_DIR)
+
+${GREEN}Download Method:${NC}
+  --usearch                Use AWS S3 Parquet files for fast, memory-efficient processing (recommended)
+  --ftp                    Use legacy FTP download method (slower, less reliable)
+
+${GREEN}Conversion Options:${NC}
+  --workers NUM            Number of parallel workers for conversion (default: $WORKERS)
+  --no-selfies             Disable SELFIES conversion (enabled by default)
+  --selfies-output NAME    Set a custom filename for the SELFIES output
+
+${GREEN}Advanced & Process Control:${NC}
+  -m, --max-files NUM      Max FTP files to process (FTP mode only, default: all)
+  -r, --resume             Resume previous job (default: enabled)
+  -R, --no-resume          Start fresh, ignoring previous state
+  -C, --cleanup            Clean up cache directory after completion
+  -s, --status             Show current download status
+  -k, --kill               Kill the running download process
+  --debug                  Enable debug mode for more verbose logging
+  -h, --help               Show this help message
+
+${YELLOW}Examples:${NC}
+  $0                                # Download 10M molecules, convert to SELFIES using usearch method
+  $0 -l 5000000 --ftp               # Download 5M molecules using legacy FTP
+  $0 --no-selfies                   # Download SMILES only (no SELFIES conversion)
+  $0 -s                             # Check current job status
+  $0 -k                             # Stop the running job
+EOF
 }
 
 # =============================================================================
-# System Checks
+# System and Dependency Checks
 # =============================================================================
 
 check_dependencies() {
     log_info "Checking system dependencies..."
-    
     local missing_deps=()
     
-    # Check Python
-    if ! command -v python3 &> /dev/null; then
-        missing_deps+=("python3")
-    fi
+    command -v python3 &> /dev/null || missing_deps+=("python3")
     
-    # Check aria2c
-    if ! command -v aria2c &> /dev/null; then
-        missing_deps+=("aria2c")
-    fi
-    
-    # Check required Python packages
-    if ! python3 -c "import requests" &> /dev/null; then
-        missing_deps+=("python3-requests")
+    if [ "$DOWNLOAD_METHOD" = "usearch" ]; then
+        command -v aws &> /dev/null || missing_deps+=("aws-cli")
+        python3 -c "import pyarrow" &> /dev/null || missing_deps+=("python3-pyarrow")
+    else # ftp
+        command -v aria2c &> /dev/null || missing_deps+=("aria2c")
     fi
     
     if [ ${#missing_deps[@]} -ne 0 ]; then
         log_error "Missing dependencies: ${missing_deps[*]}"
-        echo -e "${RED}Please install missing dependencies:${NC}"
-        echo "  sudo apt-get update"
-        echo "  sudo apt-get install ${missing_deps[*]}"
+        echo -e "${RED}Please install missing dependencies and try again.${NC}"
+        echo "Suggestions:"
+        echo "  - For python3-pyarrow: pip install pyarrow"
+        echo "  - For aws-cli: pip install awscli"
+        echo "  - For others: sudo apt-get install -y <package> or brew install <package>"
         exit 1
     fi
-    
-    log_success "All dependencies satisfied"
+    log_success "All dependencies satisfied."
 }
 
 check_disk_space() {
-    local cache_dir="$1"
-    local required_gb=50  # Minimum 50GB recommended
+    local target_dir="$1"
+    local required_gb="$2"
+    log_info "Checking disk space in '$target_dir' (requires ~${required_gb}GB)..."
     
-    log_info "Checking available disk space..."
+    local available_gb
+    available_gb=$(df -BG "$target_dir" | awk 'NR==2 {print $4}' | sed 's/G//')
     
-    local available_kb=$(df "$cache_dir" | awk 'NR==2 {print $4}')
-    local available_gb=$((available_kb / 1024 / 1024))
-    
-    if [ $available_gb -lt $required_gb ]; then
-        log_warn "Low disk space: ${available_gb}GB available, ${required_gb}GB recommended"
-        echo -e "${YELLOW}Continue anyway? (y/N)${NC}"
-        read -r response
+    if [ "$available_gb" -lt "$required_gb" ]; then
+        log_warn "Low disk space: ${available_gb}GB available, but ${required_gb}GB is recommended."
+        read -p "Continue anyway? (y/N) " -r response
         if [[ ! "$response" =~ ^[Yy]$ ]]; then
-            log_info "Download cancelled by user"
+            log_info "Download cancelled by user."
             exit 0
         fi
-    else
-        log_success "Sufficient disk space: ${available_gb}GB available"
     fi
+    log_success "Sufficient disk space available (${available_gb}GB)."
 }
 
 # =============================================================================
@@ -178,52 +173,29 @@ check_disk_space() {
 # =============================================================================
 
 save_state() {
-    local limit="$1"
-    local output="$2"
-    local data_dir="$3"
-    local cache_subdir="$4"
-    local output_subdir="$5"
-    local max_files="$6"
-    local convert_to_selfies="$7"
-    local selfies_output="$8"
-    local pid="$9"
-    
+    local pid="$1"; shift
     mkdir -p "$LOG_DIR"
     
-    cat > "$STATE_FILE" << EOF
-{
-    "limit": $limit,
-    "output": "$output",
-    "data_dir": "$data_dir",
-    "cache_subdir": "$cache_subdir",
-    "output_subdir": "$output_subdir",
-    "max_files": "$max_files",
-    "convert_to_selfies": $convert_to_selfies,
-    "selfies_output": "$selfies_output",
-    "pid": $pid,
-    "start_time": $START_TIME,
-    "status": "running"
-}
-EOF
-}
-
-load_state() {
-    if [ -f "$STATE_FILE" ]; then
-        if command -v jq &> /dev/null; then
-            # Use jq if available
-            echo "$(cat "$STATE_FILE")"
-        else
-            # Fallback to simple parsing
-            cat "$STATE_FILE"
-        fi
-    else
-        echo "{}"
-    fi
+    # Store all passed arguments in the state file
+    jq -n \
+        --arg limit "$LIMIT" \
+        --arg output "$OUTPUT_SMILES" \
+        --arg data_dir "$DATA_DIR" \
+        --arg max_files "$MAX_FILES" \
+        --arg convert_to_selfies "$CONVERT_TO_SELFIES" \
+        --arg selfies_output "$OUTPUT_SELFIES" \
+        --arg pid "$pid" \
+        --arg start_time "$START_TIME" \
+        --arg status "running" \
+        --arg workers "$WORKERS" \
+        '{limit: $limit, output: $output, data_dir: $data_dir, max_files: $max_files, convert_to_selfies: $convert_to_selfies, selfies_output: $selfies_output, pid: $pid, start_time: $start_time, status: $status, workers: $workers}' \
+        > "$STATE_FILE"
 }
 
-update_state() {
+update_state_status() {
     local status="$1"
     if [ -f "$STATE_FILE" ]; then
+        # Use jq to update status if available, otherwise use sed
         if command -v jq &> /dev/null; then
             jq ".status = \"$status\"" "$STATE_FILE" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
         else
@@ -233,482 +205,289 @@ update_state() {
 }
 
 # =============================================================================
-# Progress Monitoring
+# Job Monitoring and Control
 # =============================================================================
 
-show_progress_bar() {
-    local current=$1
-    local total=$2
-    local width=50
-    local percentage=$((current * 100 / total))
-    local filled=$((current * width / total))
-    local empty=$((width - filled))
-    
-    printf "\r${CYAN}Progress: [${NC}"
-    printf "%${filled}s" | tr ' ' '='
-    printf "%${empty}s" | tr ' ' '-'
-    printf "${CYAN}] %d%% (%d/%d)${NC}" $percentage $current $total
-}
-
-monitor_python_process() {
+monitor_pipeline() {
     local pid=$1
-    local limit=$2
+    log_info "Monitoring pipeline process (PID: $pid). The script will show its own progress."
+    log_info "Logs are being written to: $PROGRESS_LOG"
     
-    log_info "Monitoring download process (PID: $pid)"
-    log_info "Progress updates every 3 seconds..."
-    
-    local last_collected=0
-    local stall_count=0
-    
-    while kill -0 $pid 2>/dev/null; do
-        # Parse progress from Python output
-        if [ -f "$PROGRESS_FILE" ]; then
-            local collected=$(tail -n 100 "$PROGRESS_FILE" | grep -o "Total collected: [0-9,]*" | tail -1 | grep -o "[0-9,]*" | tr -d ',')
-            local current_file=$(tail -n 20 "$PROGRESS_FILE" | grep -o "Processing file [0-9]*/[0-9]*" | tail -1)
-            local download_status=$(tail -n 10 "$PROGRESS_FILE" | grep -E "(Downloading|Successfully|Failed)" | tail -1)
-            
-            if [ -n "$collected" ] && [ "$collected" -gt 0 ]; then
-                show_enhanced_progress "$collected" "$limit" "$current_file" "$download_status"
-                TOTAL_SMILES=$collected
-                
-                # Check for stalled progress
-                if [ "$collected" -eq "$last_collected" ]; then
-                    ((stall_count++))
-                    if [ $stall_count -ge 10 ]; then
-                        log_warn "Progress appears stalled. Process may be downloading large file..."
-                        stall_count=0
-                    fi
-                else
-                    stall_count=0
-                    last_collected=$collected
-                fi
-            fi
-        fi
-        
-        sleep 3
-    done
-    
-    echo  # New line after progress bar
-    log_info "Process monitoring completed"
-}
-
-show_enhanced_progress() {
-    local current=$1
-    local total=$2
-    local file_info="$3"
-    local download_status="$4"
-    
-    local percentage=$((current * 100 / total))
-    local width=40
-    local filled=$((current * width / total))
-    local empty=$((width - filled))
-    
-    # Create gradient progress bar
-    local bar=""
-    for ((i=0; i<filled; i++)); do
-        bar+="█"
-    done
-    for ((i=0; i<empty; i++)); do
-        bar+="░"
-    done
-    
-    # Calculate ETA
-    local elapsed=$(($(date +%s) - START_TIME))
-    local rate=$((current * 3600 / elapsed))
-    local remaining=$((total - current))
-    local eta_hours=$((remaining / rate))
-    local eta_str="∞"
-    
-    if [ $rate -gt 0 ] && [ $eta_hours -lt 24 ]; then
-        if [ $eta_hours -gt 0 ]; then
-            eta_str="${eta_hours}h"
-        else
-            local eta_minutes=$((remaining * 60 / rate))
-            eta_str="${eta_minutes}m"
-        fi
-    fi
-    
-    printf "\rProgress: [%s] %d%% (%'d/%'d) | Rate: %'d/h | ETA: %s" \
-           "$bar" "$percentage" "$current" "$total" "$rate" "$eta_str"
-    
-    # Show file info on next line if available
-    if [ -n "$file_info" ]; then
-        printf "\n%s" "$file_info"
-        printf "\r"
-    fi
-}
-
-# =============================================================================
-# Download Management
-# =============================================================================
-
-start_download() {
-    local limit="$1"
-    local output="$2"
-    local data_dir="$3"
-    local cache_subdir="$4"
-    local output_subdir="$5"
-    local max_files="$6"
-    local cleanup="$7"
-    local convert_to_selfies="$8"
-    local selfies_output="$9"
-    
-    # Set start time for progress monitoring
-    START_TIME=$(date +%s)
-    
-    if [ "$DEBUG_MODE" = true ]; then
-        log_info "Debug mode enabled. Clearing logs."
-        rm -f "$LOG_DIR"/*
-    fi
-
-    echo -e "${GREEN}Starting PubChem Download Pipeline${NC}"
-    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    log_info "Target molecules: $(printf "%'d" "$limit")"
-    log_info "SMILES output: $output"
-    
-    if [ "$convert_to_selfies" = true ]; then
-        local selfies_name="$selfies_output"
-        if [ -z "$selfies_name" ]; then
-            local stem=$(basename "$output" .txt)
-            selfies_name="${stem}_selfies.txt"
-        fi
-        log_info "SELFIES output: $selfies_name"
-        log_info "Conversion: ENABLED (modern ML format)"
-    else
-        log_info "SELFIES conversion: DISABLED"
-    fi
-    
-    log_info "Data directory: $data_dir"
-    log_info "Cache location: $data_dir/$cache_subdir"
-    log_info "Output location: $data_dir/$output_subdir"
-    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    
-    # Check disk space
-    check_disk_space "$data_dir/$cache_subdir"
-    
-    # Prepare Python command
-    local python_cmd="python3 '$PYTHON_SCRIPT' --limit $limit --output '$output' --data-dir '$data_dir' --cache-subdir '$cache_subdir' --output-subdir '$output_subdir'"
-    
-    if [ "$DEBUG_MODE" = true ]; then
-        python_cmd="$python_cmd --debug"
-    fi
-
-    if [ -n "$max_files" ]; then
-        python_cmd="$python_cmd --max-files $max_files"
-    fi
-    
-    if [ "$cleanup" = true ]; then
-        python_cmd="$python_cmd --cleanup"
-    fi
-    
-    if [ "$convert_to_selfies" = false ]; then
-        python_cmd="$python_cmd --no-convert-to-selfies"
-    else
-        if [ -n "$selfies_output" ]; then
-            python_cmd="$python_cmd --selfies-output '$selfies_output'"
-        fi
-    fi
-    
-    # Redirect Python output to log file
-    python_cmd="$python_cmd 2>&1 | tee -a '$PROGRESS_FILE'"
-    
-    # Start Python process in background
-    eval "$python_cmd" &
-    local pid=$!
-    
-    # Save state
-    save_state "$limit" "$output" "$data_dir" "$cache_subdir" "$output_subdir" "$max_files" "$convert_to_selfies" "$selfies_output" "$pid"
-    
-    # Monitor progress
-    monitor_python_process "$pid" "$limit"
-    
-    # Wait for completion
-    wait $pid
-    local exit_code=$?
-    
-    if [ $exit_code -eq 0 ]; then
-        log_success "Download completed successfully!"
-        update_state "completed"
-        show_completion_stats
-    else
-        log_error "Download failed with exit code: $exit_code"
-        update_state "failed"
-        return $exit_code
-    fi
+    # Wait for the background process to complete
+    wait "$pid"
+    return $?
 }
 
 show_completion_stats() {
-    local end_time=$(date +%s)
+    local end_time
+    end_time=$(date +%s)
     local duration=$((end_time - START_TIME))
     local hours=$((duration / 3600))
     local minutes=$(((duration % 3600) / 60))
     local seconds=$((duration % 60))
     
-    # Check if SELFIES was generated
-    local selfies_info=""
-    if [ -f "$data_dir/$output_subdir/${output%.*}_selfies.txt" ]; then
-        selfies_info="SELFIES dataset ready for ML training"
+    # Try to get final count from logs
+    TOTAL_SMILES=$(grep -o "Total SMILES collected: [0-9,]*" "$PROGRESS_LOG" | tail -1 | grep -o "[0-9,]*" | tr -d ',' || echo 0)
+    
+    local avg_rate=0
+    if [ "$duration" -gt 0 ]; then
+        avg_rate=$((TOTAL_SMILES * 3600 / duration))
     fi
     
+    local selfies_file="${OUTPUT_SMILES%.*}_selfies.txt"
+    local selfies_info="SELFIES file: $selfies_file"
+    if [ "$CONVERT_TO_SELFIES" = false ]; then
+        selfies_info="SELFIES conversion was disabled."
+    fi
+
     echo -e "${GREEN}"
     echo "╔══════════════════════════════════════════════════════════════════════════════╗"
-    echo "║                             DOWNLOAD COMPLETED                              ║"
+    echo "║                             PIPELINE COMPLETED                             ║"
     echo "╠══════════════════════════════════════════════════════════════════════════════╣"
-    echo "║ Molecules Collected: $(printf "%'12d" "$TOTAL_SMILES")                                      ║"
-    echo "║ Total Duration:      $(printf "%02d:%02d:%02d" $hours $minutes $seconds)                                           ║"
-    echo "║ Average Rate:        $(printf "%'12.0f" $((TOTAL_SMILES * 3600 / duration))) molecules/hour                         ║"
-    if [ -n "$selfies_info" ]; then
-        echo "║ $selfies_info                                 ║"
-    fi
+    printf "║ Molecules Collected: %'12d                                      ║\n" "$TOTAL_SMILES"
+    printf "║ Total Duration:      %02d:%02d:%02d                                           ║\n" "$hours" "$minutes" "$seconds"
+    printf "║ Average Rate:        %'12.0f molecules/hour                         ║\n" "$avg_rate"
+    printf "║ %-66s ║\n" "$selfies_info"
     echo "╠══════════════════════════════════════════════════════════════════════════════╣"
-    echo "║ Output Files:                                                               ║"
-    echo "║   • SMILES: $output                                              ║"
-    if [ -n "$selfies_info" ]; then
-        echo "║   • SELFIES: ${output%.*}_selfies.txt                                  ║"
-    fi
+    echo "║ SMILES file: $OUTPUT_SMILES                                                   ║"
+    echo "║ Full logs are available in: $LOG_DIR                                 ║"
     echo "╚══════════════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
-    
-    echo -e "${BLUE}Next steps:${NC}"
-    echo -e "   • Check output files in: $data_dir/$output_subdir/"
-    echo -e "   • Use --cleanup to free disk space"
-    echo -e "   • Ready for ML training and analysis!"
 }
 
 # =============================================================================
-# Status and Control
+# Main Pipeline Execution
+# =============================================================================
+
+start_pipeline() {
+    log_info "Preparing for new pipeline run by cleaning logs, output, and state files."
+    
+    # Clean directories and state file safely to ensure a fresh start.
+    rm -f "$STATE_FILE"
+    # Use find to delete contents without deleting the directories themselves.
+    # The '|| true' part ensures the script doesn't fail if a directory doesn't exist.
+    find "$LOG_DIR" -mindepth 1 -delete 2>/dev/null || true
+    
+    local output_dir="$DATA_DIR/output"
+    # Only try to clean output dir if it exists.
+    if [ -d "$output_dir" ]; then
+        find "$output_dir" -mindepth 1 -delete 2>/dev/null || true
+    fi
+    
+    log_info "Previous run artifacts have been cleared."
+
+    START_TIME=$(date +%s)
+
+    echo -e "${GREEN}Starting PubChem Data Pipeline${NC}"
+    echo "--------------------------------------------------"
+    log_info "Download method: $DOWNLOAD_METHOD"
+    log_info "Target molecules: $(printf "%'d" "$LIMIT")"
+    log_info "SMILES output file: $OUTPUT_SMILES"
+    
+    if [ "$CONVERT_TO_SELFIES" = true ]; then
+        local selfies_name="$OUTPUT_SELFIES"
+        if [ -z "$selfies_name" ]; then
+            selfies_name="${OUTPUT_SMILES%.*}_selfies.txt"
+        fi
+        log_info "SELFIES conversion: ENABLED -> $selfies_name"
+    else
+        log_info "SELFIES conversion: DISABLED"
+    fi
+    
+    local data_cache_dir="$DATA_DIR/cache"
+    if [ "$DOWNLOAD_METHOD" = "usearch" ]; then
+        log_info "Data source: AWS S3 (usearch-molecules)"
+        mkdir -p "$data_cache_dir"
+        check_disk_space "$data_cache_dir" 35
+        
+        log_info "Syncing PubChem Parquet files from AWS S3... (this may take a while)"
+        if ! aws s3 sync --no-sign-request "s3://usearch-molecules/data/pubchem/parquet/" "$data_cache_dir"; then
+            log_error "Failed to download data from S3. Check your connection and AWS CLI setup."
+            exit 1
+        fi
+        log_success "S3 sync complete."
+
+    else # ftp
+        check_disk_space "$data_cache_dir" 50
+    fi
+    
+    # Construct Python command
+    local python_cmd=(
+        python3 "$PYTHON_SCRIPT"
+        --method "$DOWNLOAD_METHOD"
+        --limit "$LIMIT"
+        --output "$OUTPUT_SMILES"
+        --data-dir "$DATA_DIR"
+        --workers "$WORKERS"
+    )
+    [ "$DEBUG_MODE" = true ] && python_cmd+=(--debug)
+    [ -n "$MAX_FILES" ] && python_cmd+=(--max-files "$MAX_FILES")
+    [ "$CLEANUP" = true ] && python_cmd+=(--cleanup)
+    [ "$CONVERT_TO_SELFIES" = false ] && python_cmd+=(--no-selfies)
+    [ -n "$OUTPUT_SELFIES" ] && python_cmd+=(--selfies-output "$OUTPUT_SELFIES")
+    
+    # Execute Python pipeline in the background and monitor it
+    "${python_cmd[@]}" 2>&1 | tee -a "$PROGRESS_LOG" &
+    local pid=$!
+    
+    save_state "$pid"
+    
+    monitor_pipeline "$pid"
+    local exit_code=$?
+    
+    if [ $exit_code -eq 0 ]; then
+        log_success "Pipeline completed successfully!"
+        update_state_status "completed"
+        show_completion_stats
+    else
+        log_error "Pipeline failed with exit code: $exit_code"
+        update_state_status "failed"
+        return $exit_code
+    fi
+}
+
+# =============================================================================
+# Status and Control Commands
 # =============================================================================
 
 show_status() {
     if [ ! -f "$STATE_FILE" ]; then
-        echo -e "${YELLOW}No download state found${NC}"
+        echo -e "${YELLOW}No pipeline state file found. No job appears to be running or have run.${NC}"
         return 0
     fi
     
-    local state=$(load_state)
-    
-    echo -e "${CYAN}Current Download Status:${NC}"
+    echo -e "${CYAN}Current Pipeline Status:${NC}"
     echo "========================="
     
-    if command -v jq &> /dev/null; then
-        local status=$(echo "$state" | jq -r '.status // "unknown"')
-        local limit=$(echo "$state" | jq -r '.limit // "unknown"')
-        local pid=$(echo "$state" | jq -r '.pid // "unknown"')
-        local start_time=$(echo "$state" | jq -r '.start_time // "unknown"')
-        
-        echo "Status: $status"
-        echo "Target SMILES: $(printf "%'d" "$limit")"
-        echo "Process ID: $pid"
-        
-        if [ "$pid" != "unknown" ] && kill -0 "$pid" 2>/dev/null; then
-            echo -e "${GREEN}Process is running${NC}"
-        else
-            echo -e "${RED}Process is not running${NC}"
-        fi
-        
-        if [ "$start_time" != "unknown" ]; then
-            local current_time=$(date +%s)
-            local duration=$((current_time - start_time))
-            local hours=$((duration / 3600))
-            local minutes=$(((duration % 3600) / 60))
-            echo "Running time: ${hours}h ${minutes}m"
-        fi
-    else
-        echo "State file exists but jq not available for detailed parsing"
+    if ! command -v jq &> /dev/null; then
+        log_warn "jq is not installed. Displaying raw state file."
         cat "$STATE_FILE"
+        return 0
     fi
     
-    # Show recent progress
-    if [ -f "$PROGRESS_FILE" ]; then
-        echo -e "\n${CYAN}Recent Progress:${NC}"
-        echo "================"
-        tail -n 10 "$PROGRESS_FILE"
-    fi
-}
-
-kill_download() {
-    local state=$(load_state)
+    local status; status=$(jq -r '.status // "unknown"' "$STATE_FILE")
+    local pid; pid=$(jq -r '.pid // "unknown"' "$STATE_FILE")
     
-    if command -v jq &> /dev/null; then
-        local pid=$(echo "$state" | jq -r '.pid // ""')
-        
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            log_info "Killing download process (PID: $pid)"
-            kill -TERM "$pid" 2>/dev/null || true
-            sleep 3
-            
-            if kill -0 "$pid" 2>/dev/null; then
-                log_warn "Process still running, force killing..."
-                kill -KILL "$pid" 2>/dev/null || true
-            fi
-            
-            update_state "killed"
-            log_success "Download process terminated"
-        else
-            log_warn "No running download process found"
-        fi
+    jq -r '"Status: \(.status)\nTarget SMILES: \(.limit|tonumber|tostring|gsub(",";"")|tonumber|tostring)\nProcess ID: \(.pid)\nWorkers: \(.workers)"' "$STATE_FILE"
+    
+    if [ "$pid" != "unknown" ] && kill -0 "$pid" 2>/dev/null; then
+        echo -e "${GREEN}Process is currently running.${NC}"
+        local start_time; start_time=$(jq -r '.start_time // 0' "$STATE_FILE")
+        local duration=$(( $(date +%s) - start_time ))
+        echo "Running time: $(date -u -d "@$duration" +'%Hh %Mm %Ss')"
     else
-        log_error "Cannot kill process - jq not available"
+        echo -e "${RED}Process is not running.${NC}"
+    fi
+    
+    if [ -f "$PROGRESS_LOG" ]; then
+        echo -e "\n${CYAN}Recent Progress Log:${NC}"
+        echo "====================="
+        tail -n 10 "$PROGRESS_LOG"
     fi
 }
 
-# =============================================================================
-# Signal Handlers
-# =============================================================================
+kill_pipeline() {
+    if [ ! -f "$STATE_FILE" ]; then
+        log_warn "No state file found. Cannot determine process to kill."
+        return 1
+    fi
+
+    if ! command -v jq &> /dev/null; then
+        log_error "Cannot kill process - jq is not installed to read PID from state file."
+        return 1
+    fi
+    
+    local pid; pid=$(jq -r '.pid // ""' "$STATE_FILE")
+    
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        log_info "Killing pipeline process (PID: $pid) and its children..."
+        # Kill the entire process group to stop child processes (like aria2c)
+        kill -TERM -"$pid" 2>/dev/null || true
+        sleep 2
+        
+        if kill -0 "$pid" 2>/dev/null; then
+            log_warn "Process still running, sending SIGKILL."
+            kill -KILL -"$pid" 2>/dev/null || true
+        fi
+        
+        update_state_status "killed"
+        log_success "Pipeline process terminated."
+    else
+        log_warn "No running pipeline process found to kill."
+    fi
+}
 
 cleanup_on_exit() {
-    if [ -n "${DOWNLOAD_PID:-}" ]; then
-        log_info "Cleaning up on exit..."
-        kill -TERM "$DOWNLOAD_PID" 2>/dev/null || true
-        update_state "interrupted"
+    if [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null; then
+        log_warn "Script interrupted. Cleaning up background process..."
+        kill_pipeline
+        update_state_status "interrupted"
     fi
 }
-
-trap cleanup_on_exit EXIT INT TERM
+trap cleanup_on_exit INT TERM
 
 # =============================================================================
-# Main Function
+# Main Entry Point
 # =============================================================================
 
 main() {
-    local limit="$DEFAULT_LIMIT"
-    local output="$DEFAULT_OUTPUT"
-    local data_dir="$DEFAULT_DATA_DIR"
-    local cache_subdir="$DEFAULT_CACHE_SUBDIR"
-    local output_subdir="$DEFAULT_OUTPUT_SUBDIR"
-    local max_files="$DEFAULT_MAX_FILES"
-    local cleanup="$DEFAULT_CLEANUP"
-    local resume="$DEFAULT_RESUME"
-    local convert_to_selfies="$DEFAULT_CONVERT_TO_SELFIES"
-    local selfies_output="$DEFAULT_SELFIES_OUTPUT"
-    local show_status_only=false
-    local kill_process=false
-    
-    # Parse command line arguments
+    # Ensure jq is available for state management if possible
+    if ! command -v jq &>/dev/null; then
+        log_warn "jq command not found. State management will be limited."
+    fi
+
+    # Parse command-line arguments
     while [[ $# -gt 0 ]]; do
         case $1 in
-            -l|--limit)
-                limit="$2"
-                shift 2
-                ;;
-            -o|--output)
-                output="$2"
-                shift 2
-                ;;
-            -d|--data-dir)
-                data_dir="$2"
-                shift 2
-                ;;
-            -c|--cache-subdir)
-                cache_subdir="$2"
-                shift 2
-                ;;
-            -u|--output-subdir)
-                output_subdir="$2"
-                shift 2
-                ;;
-            -m|--max-files)
-                max_files="$2"
-                shift 2
-                ;;
-            -r|--resume)
-                resume=true
-                shift
-                ;;
-            -R|--no-resume)
-                resume=false
-                shift
-                ;;
-            -C|--cleanup)
-                cleanup=true
-                shift
-                ;;
-            -N|--no-convert)
-                convert_to_selfies=false
-                shift
-                ;;
-            -f|--selfies-output)
-                selfies_output="$2"
-                shift 2
-                ;;
-            -s|--status)
-                show_status_only=true
-                shift
-                ;;
-            -k|--kill)
-                kill_process=true
-                shift
-                ;;
-            --debug)
-                DEBUG_MODE=true
-                shift
-                ;;
-            -h|--help)
-                show_usage
-                exit 0
-                ;;
-            *)
-                log_error "Unknown option: $1"
-                show_usage
-                exit 1
-                ;;
+            -l|--limit) LIMIT="$2"; shift 2 ;;
+            -o|--output) OUTPUT_SMILES="$2"; shift 2 ;;
+            -d|--data-dir) DATA_DIR="$2"; shift 2 ;;
+            -m|--max-files) MAX_FILES="$2"; shift 2 ;;
+            --workers) WORKERS="$2"; shift 2 ;;
+            -r|--resume) RESUME=true; shift ;;
+            -R|--no-resume) RESUME=false; shift ;;
+            -C|--cleanup) CLEANUP=true; shift ;;
+            --no-selfies) CONVERT_TO_SELFIES=false; shift ;;
+            --selfies-output) OUTPUT_SELFIES="$2"; shift 2 ;;
+            -s|--status) show_status; exit 0 ;;
+            -k|--kill) kill_pipeline; exit 0 ;;
+            --debug) DEBUG_MODE=true; shift ;;
+            --usearch) DOWNLOAD_METHOD="usearch"; shift ;;
+            --ftp) DOWNLOAD_METHOD="ftp"; shift ;;
+            -h|--help) show_usage; exit 0 ;;
+            *) log_error "Unknown option: $1"; show_usage; exit 1 ;;
         esac
     done
     
-    # Create necessary directories
-    mkdir -p "$LOG_DIR"
-    mkdir -p "$data_dir/$cache_subdir"
-    mkdir -p "$data_dir/$output_subdir"
+    mkdir -p "$LOG_DIR" "$DATA_DIR/cache" "$DATA_DIR/output"
     
-    # Handle special commands
-    if [ "$show_status_only" = true ]; then
-        show_status
-        exit 0
-    fi
-    
-    if [ "$kill_process" = true ]; then
-        kill_download
-        exit 0
-    fi
-    
-    # Show banner
     show_banner
-    
-    # Check dependencies
     check_dependencies
     
-    # Check if Python script exists
     if [ ! -f "$PYTHON_SCRIPT" ]; then
-        log_error "Python script not found: $PYTHON_SCRIPT"
+        log_error "Python pipeline script not found: $PYTHON_SCRIPT"
         exit 1
     fi
     
     # Handle resume logic
-    if [ "$resume" = true ] && [ -f "$STATE_FILE" ]; then
-        local state=$(load_state)
-        if command -v jq &> /dev/null; then
-            local status=$(echo "$state" | jq -r '.status // "unknown"')
-            local pid=$(echo "$state" | jq -r '.pid // ""')
-            
-            if [ "$status" = "running" ] && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-                log_info "Download already running (PID: $pid)"
-                echo -e "${YELLOW}Continue monitoring? (y/N)${NC}"
-                read -r response
-                if [[ "$response" =~ ^[Yy]$ ]]; then
-                    monitor_python_process "$pid" "$limit"
-                    exit 0
-                fi
+    if [ "$RESUME" = true ] && [ -f "$STATE_FILE" ]; then
+        local status; status=$(jq -r '.status // "unknown"' "$STATE_FILE")
+        local pid; pid=$(jq -r '.pid // ""' "$STATE_FILE")
+        
+        if [ "$status" = "running" ] && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            log_warn "Pipeline is already running (PID: $pid)."
+            read -p "Continue monitoring this job? (Y/n) " -r response
+            if [[ ! "$response" =~ ^[Nn]$ ]]; then
+                monitor_pipeline "$pid"
+                exit $?
+            else
+                exit 0
             fi
         fi
     fi
     
-    # Start download
-    start_download "$limit" "$output" "$data_dir" "$cache_subdir" "$output_subdir" "$max_files" "$cleanup" "$convert_to_selfies" "$selfies_output"
+    start_pipeline
 }
-
-# =============================================================================
-# Script Entry Point
-# =============================================================================
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     main "$@"
