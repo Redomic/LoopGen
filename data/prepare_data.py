@@ -22,6 +22,7 @@ import time
 import hashlib
 import re
 import glob
+import csv
 try:
     import pyarrow.parquet as pq
     PYARROW_AVAILABLE = True
@@ -52,36 +53,38 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def _worker_convert_smiles(smiles: str) -> Tuple[str, Optional[str], Optional[str]]:
+def _worker_convert_smiles(smiles: str) -> Tuple[str, Optional[str], Optional[str], Optional[str]]:
     """
     Worker function to convert a single SMILES to SELFIES for multiprocessing.
 
-    Returns a tuple of (original_smiles, selfies_result, error_message).
+    Returns a tuple of (original_smiles, processed_smiles, selfies_result, error_message).
     This function is defined at the top level to be pickleable.
     """
     if not SELFIES_AVAILABLE:
-        return smiles, None, "SELFIES library not available in worker process."
+        return smiles, None, None, "SELFIES library not available in worker process."
 
     smiles = smiles.strip()
     if not smiles:
-        return smiles, None, "Empty SMILES string"
+        return smiles, None, None, "Empty SMILES string"
         
     try:
         # Use enhanced conversion with preprocessing to avoid hydrogen warnings
-        selfies = convert_smiles_to_selfies(
+        selfies, validation_info = convert_smiles_to_selfies(
             smiles, 
             validate_input=True,
-            preprocess=True  # This will clean up problematic structures
+            preprocess=True,  # This will clean up problematic structures
+            return_validation_info=True
         )
-        return smiles, selfies, None
+        processed_smiles = validation_info.get('preprocessed_smiles', smiles)
+        return smiles, processed_smiles, selfies, None
     except (InvalidSMILESError, MolecularConversionError) as e:
         # Extract the specific reason if available
         error_msg = str(e)
         if "SMILES failed preprocessing" in error_msg:
-            return smiles, None, "Failed quality checks"
-        return smiles, None, error_msg
+            return smiles, None, None, "Failed quality checks"
+        return smiles, None, None, error_msg
     except Exception as e:
-        return smiles, None, f"Unexpected error: {str(e)}"
+        return smiles, None, None, f"Unexpected error: {str(e)}"
 
 
 class PubChemDownloadError(Exception):
@@ -107,7 +110,7 @@ class PubChemSMILESPipeline:
     def __init__(
         self,
         data_dir: str = "data",
-        cache_subdir: str = "cache",
+        cache_subdir: str = "pubchem",
         output_subdir: str = "output",
         aria2c_connections: int = 5,
         max_retries: int = 5,
@@ -412,6 +415,7 @@ class PubChemSMILESPipeline:
         successful_conversions = 0
         failed_conversions = 0
         failure_reasons = {}
+        processed_smiles_set = set()
         
         # Count total lines for accurate progress reporting
         logger.info("Counting molecules in input file...")
@@ -420,9 +424,12 @@ class PubChemSMILESPipeline:
         logger.info(f"Found {total_to_process:,} molecules to process.")
 
         with open(input_filepath, 'r') as input_file, \
-             open(output_filepath, 'w') as output_file, \
+             open(output_filepath, 'w', newline='') as output_csv_file, \
              open(failures_filepath, 'w') as failures_file, \
              ProcessPoolExecutor(max_workers=num_workers) as executor:
+
+            writer = csv.writer(output_csv_file)
+            writer.writerow(["SELFIES", "SMILES"])
 
             failures_file.write("SMILES\tReason\n")
             
@@ -432,12 +439,16 @@ class PubChemSMILESPipeline:
             total_lines = 0
             start_time = time.time()
             self._update_progress(0, total_to_process, start_time, prefix="Converting")
-            for i, (original_smiles, selfies_result, error_message) in enumerate(results_iterator):
+            for i, (original_smiles, processed_smiles, selfies_result, error_message) in enumerate(results_iterator):
                 total_lines += 1
-                if selfies_result:
-                    output_file.write(f"{selfies_result}\n")
+                if selfies_result and processed_smiles not in processed_smiles_set:
+                    writer.writerow([selfies_result, processed_smiles])
+                    processed_smiles_set.add(processed_smiles)
                     successful_conversions += 1
                 else:
+                    if error_message is None and processed_smiles in processed_smiles_set:
+                        error_message = "Duplicate SMILES"
+
                     failures_file.write(f"{original_smiles}\t{error_message}\n")
                     failed_conversions += 1
                     reason = error_message or "Unknown error"
@@ -454,6 +465,7 @@ class PubChemSMILESPipeline:
         conversion_stats = {
             "total_processed": total_lines,
             "successful_conversions": successful_conversions,
+            "duplicate_smiles": len(processed_smiles_set) - successful_conversions if successful_conversions < len(processed_smiles_set) else 0,
             "failed_conversions": failed_conversions,
             "success_rate": successful_conversions / total_lines if total_lines > 0 else 0,
             "failure_reasons": failure_reasons,
@@ -645,7 +657,7 @@ class PubChemSMILESPipeline:
         
         if selfies_filename is None:
             stem = Path(input_filename).stem
-            selfies_filename = f"{stem}_selfies.txt"
+            selfies_filename = f"{stem}_selfies.csv"
         
         logger.info("Starting SELFIES conversion...")
         self.convert_smiles_to_selfies_file(
@@ -675,7 +687,7 @@ def main():
         help="Download method to use. 'usearch' is faster and memory-efficient."
     )
     parser.add_argument("--limit", type=int, default=10_000_000, help="Target number of SMILES molecules.")
-    parser.add_argument("--output", type=str, default="training.txt", help="Output filename for SMILES.")
+    parser.add_argument("--output", type=str, default="training.csv", help="Output filename for SMILES.")
     parser.add_argument("--data-dir", type=str, default="data", help="Main data directory.")
     parser.add_argument("--max-files", type=int, default=None, help="Maximum number of SDF files to process (FTP method only).")
     parser.add_argument("--cleanup", action="store_true", help="Clean up cache directory after completion.")

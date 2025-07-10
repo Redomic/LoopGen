@@ -3,3 +3,7 @@ __pycache__/
 /data/cache/
 /data/logs/
 /data/output/
+/data/crossdocked/
+/data/pubchem/
+
+/libmolgrid

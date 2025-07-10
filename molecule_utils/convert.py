@@ -41,6 +41,7 @@ class MolecularFilterReason(Enum):
     CHARGED_STRUCTURE = "charged_structure"
     EXPLICIT_HYDROGEN = "explicit_hydrogen"
     MOLECULAR_WEIGHT_OUT_OF_RANGE = "molecular_weight_out_of_range"
+    LOGP_OUT_OF_RANGE = "logp_out_of_range"
     TOO_MANY_ATOMS = "too_many_atoms"
     STANDARDIZATION_FAILED = "standardization_failed"
     CONVERSION_FAILED = "conversion_failed"
@@ -56,8 +57,9 @@ class MolecularFilterConfig:
     remove_isotopes: bool = True
     remove_explicit_hydrogens: bool = True
     remove_fragments: bool = True
-    min_molecular_weight: float = 50.0
-    max_molecular_weight: float = 1000.0
+    min_molecular_weight: float = 150.0
+    max_molecular_weight: float = 500.0
+    max_logp: float = 5.0
     max_num_atoms: int = 200
     allowed_elements: Optional[Set[str]] = None
     
@@ -214,6 +216,10 @@ class MolecularFilter:
         mol_weight = Descriptors.MolWt(standardized_mol)
         if mol_weight < self.config.min_molecular_weight or mol_weight > self.config.max_molecular_weight:
             return False, MolecularFilterReason.MOLECULAR_WEIGHT_OUT_OF_RANGE, None
+        
+        logp = Descriptors.MolLogP(standardized_mol)
+        if logp >= self.config.max_logp:
+            return False, MolecularFilterReason.LOGP_OUT_OF_RANGE, None
         
         num_atoms = standardized_mol.GetNumAtoms()
         if num_atoms > self.config.max_num_atoms:

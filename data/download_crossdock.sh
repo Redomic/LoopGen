@@ -1,15 +1,16 @@
 #!/bin/bash
 
 # =============================================================================
-# PubChem SMILES/SELFIES Download & Processing Script
+# CrossDock2020 Protein-Ligand Dataset Download & Processing Script
 # =============================================================================
 #
-# Robust bash wrapper for the Python data preparation pipeline.
+# Robust bash wrapper for downloading and processing CrossDock2020 dataset.
 # Features:
 #   - Advanced command-line interface
 #   - Resumable downloads via state management
 #   - Process control (status checks, killing jobs)
 #   - Dependency checks
+#   - Checksum verification
 #
 # =============================================================================
 
@@ -17,26 +18,27 @@ set -euo pipefail  # Exit on error, undefined vars, pipe failures
 
 # --- Configuration ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON_SCRIPT="$SCRIPT_DIR/prepare_data.py"
+PYTHON_SCRIPT="$SCRIPT_DIR/prepare_crossdock.py"
 LOG_DIR="$SCRIPT_DIR/logs"
 
 # State and Logging
-STATE_FILE="$LOG_DIR/download_state.json"
-PROGRESS_LOG="$LOG_DIR/download_progress.log"
-ERROR_LOG="$LOG_DIR/download_errors.log"
+STATE_FILE="$LOG_DIR/crossdock_state.json"
+PROGRESS_LOG="$LOG_DIR/crossdock_progress.log"
+ERROR_LOG="$LOG_DIR/crossdock_errors.log"
+
+# CrossDock2020 Dataset URLs
+CROSSDOCK_BASE_URL="http://bits.csb.pitt.edu/files/crossdock2020"
+STRUCTURES_FILE="CrossDocked2020_v1.3.tgz"
+TYPES_FILE="CrossDocked2020_v1.3_types.tgz"
 
 # Default Parameters
-LIMIT=10000000
-OUTPUT_SMILES="training.csv"
+OUTPUT_CSV="protein_ligand_pairs.csv"
 DATA_DIR="data"
-MAX_FILES=""
 CLEANUP=false
 RESUME=true
-CONVERT_TO_SELFIES=true
-OUTPUT_SELFIES=""
 DEBUG_MODE=false
-DOWNLOAD_METHOD="usearch"
 WORKERS=$(nproc --all 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+EXTRACT_TYPES=true
 
 # --- UI Colors ---
 RED='\033[0;31m'
@@ -48,7 +50,6 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # --- Global State ---
-TOTAL_SMILES=0
 START_TIME=$(date +%s)
 
 # =============================================================================
@@ -74,35 +75,28 @@ log_success() {
 show_banner() {
     echo -e "${CYAN}"
     echo "╔══════════════════════════════════════════════════════════════════════════════╗"
-    echo "║                PubChem SMILES/SELFIES Data Preparation Pipeline              ║"
+    echo "║                CrossDock2020 Protein-Ligand Dataset Pipeline                 ║"
     echo "╚══════════════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
-    echo -e "${BLUE}Features: Multi-threaded processing • Progress tracking • SELFIES conversion${NC}"
-    echo -e "${BLUE}Default: $(printf "%'d" $LIMIT) molecules → $OUTPUT_SMILES + ${OUTPUT_SMILES%.*}_selfies.csv${NC}"
+    echo -e "${BLUE}Features: Robust downloads • Data processing • CSV pair generation${NC}"
+    echo -e "${BLUE}Output: Protein-ligand pairs → $OUTPUT_CSV${NC}"
     echo ""
 }
 
 show_usage() {
     cat <<EOF
-${CYAN}PubChem SMILES/SELFIES Downloader & Processor${NC}
+${CYAN}CrossDock2020 Protein-Ligand Dataset Downloader & Processor${NC}
 Usage: $0 [OPTIONS]
 
 ${GREEN}Basic Options:${NC}
-  -l, --limit LIMIT        Number of SMILES to collect (default: $(printf "%'d" $LIMIT))
-  -o, --output OUTPUT      Output filename for SMILES (default: $OUTPUT_SMILES)
+  -o, --output OUTPUT      Output CSV filename (default: $OUTPUT_CSV)
   -d, --data-dir DIR       Main data directory (default: $DATA_DIR)
 
-${GREEN}Download Method:${NC}
-  --usearch                Use AWS S3 Parquet files for fast, memory-efficient processing (recommended)
-  --ftp                    Use legacy FTP download method (slower, less reliable)
-
-${GREEN}Conversion Options:${NC}
-  --workers NUM            Number of parallel workers for conversion (default: $WORKERS)
-  --no-selfies             Disable SELFIES conversion (enabled by default)
-  --selfies-output NAME    Set a custom filename for the SELFIES output
-
+${GREEN}Processing Options:${NC}
+  --workers NUM            Number of parallel workers for processing (default: $WORKERS)
+  --no-extract-types       Skip extracting and processing types file
+  
 ${GREEN}Advanced & Process Control:${NC}
-  -m, --max-files NUM      Max FTP files to process (FTP mode only, default: all)
   -r, --resume             Resume previous job (default: enabled)
   -R, --no-resume          Start fresh, ignoring previous state
   -C, --cleanup            Clean up cache directory after completion
@@ -112,9 +106,9 @@ ${GREEN}Advanced & Process Control:${NC}
   -h, --help               Show this help message
 
 ${YELLOW}Examples:${NC}
-  $0                                # Download 10M molecules, convert to SELFIES using usearch method
-  $0 -l 5000000 --ftp               # Download 5M molecules using legacy FTP
-  $0 --no-selfies                   # Download SMILES only (no SELFIES conversion)
+  $0                                # Download and process CrossDock2020 dataset
+  $0 -o my_pairs.csv                # Custom output filename
+  $0 --no-extract-types             # Skip types file processing
   $0 -s                             # Check current job status
   $0 -k                             # Stop the running job
 EOF
@@ -127,25 +121,66 @@ EOF
 check_dependencies() {
     log_info "Checking system dependencies..."
     local missing_deps=()
+    local missing_python_deps=()
     
+    # Check system tools
     command -v python3 &> /dev/null || missing_deps+=("python3")
+    command -v aria2c &> /dev/null || missing_deps+=("aria2c")
+    command -v tar &> /dev/null || missing_deps+=("tar")
     
-    if [ "$DOWNLOAD_METHOD" = "usearch" ]; then
-        command -v aws &> /dev/null || missing_deps+=("aws-cli")
-        python3 -c "import pyarrow" &> /dev/null || missing_deps+=("python3-pyarrow")
-    else # ftp
-        command -v aria2c &> /dev/null || missing_deps+=("aria2c")
+    # Check Python packages
+    if command -v python3 &> /dev/null; then
+        log_info "Checking Python package dependencies..."
+        
+        # Check for RDKit
+        if ! python3 -c "import rdkit" &> /dev/null; then
+            missing_python_deps+=("rdkit")
+        fi
+        
+
+        
+        # Check for other essential packages
+        if ! python3 -c "import pandas" &> /dev/null; then
+            missing_python_deps+=("pandas")
+        fi
     fi
     
+    # Report missing system dependencies
     if [ ${#missing_deps[@]} -ne 0 ]; then
-        log_error "Missing dependencies: ${missing_deps[*]}"
-        echo -e "${RED}Please install missing dependencies and try again.${NC}"
-        echo "Suggestions:"
-        echo "  - For python3-pyarrow: pip install pyarrow"
-        echo "  - For aws-cli: pip install awscli"
-        echo "  - For others: sudo apt-get install -y <package> or brew install <package>"
+        log_error "Missing system dependencies: ${missing_deps[*]}"
+        echo -e "${RED}Please install missing system dependencies and try again.${NC}"
+        echo "Installation suggestions:"
+        echo "  - aria2c: sudo apt-get install aria2 (Ubuntu/Debian) or brew install aria2 (macOS)"
+        echo "  - tar: usually pre-installed on Unix systems"
         exit 1
     fi
+    
+    # Report missing Python dependencies
+    if [ ${#missing_python_deps[@]} -ne 0 ]; then
+        log_error "Missing Python dependencies: ${missing_python_deps[*]}"
+        echo -e "${RED}Critical Python packages are missing!${NC}"
+        echo ""
+        echo -e "${YELLOW}Required installations:${NC}"
+        
+        for dep in "${missing_python_deps[@]}"; do
+            case "$dep" in
+                "rdkit")
+                    echo -e "${CYAN}For RDKit:${NC}"
+                    echo "  pip install rdkit"
+                    echo "  OR: conda install -c conda-forge rdkit"
+                    echo ""
+                    ;;
+                "pandas")
+                    echo -e "${CYAN}For pandas:${NC}"
+                    echo "  pip install pandas"
+                    echo ""
+                    ;;
+            esac
+        done
+        echo "Please install the missing packages and run the script again."
+        exit 1
+    fi
+    
     log_success "All dependencies satisfied."
 }
 
@@ -176,32 +211,128 @@ save_state() {
     local pid="$1"; shift
     mkdir -p "$LOG_DIR"
     
-    # Store all passed arguments in the state file
     jq -n \
-        --arg limit "$LIMIT" \
-        --arg output "$OUTPUT_SMILES" \
+        --arg output "$OUTPUT_CSV" \
         --arg data_dir "$DATA_DIR" \
-        --arg max_files "$MAX_FILES" \
-        --arg convert_to_selfies "$CONVERT_TO_SELFIES" \
-        --arg selfies_output "$OUTPUT_SELFIES" \
+        --arg extract_types "$EXTRACT_TYPES" \
         --arg pid "$pid" \
         --arg start_time "$START_TIME" \
         --arg status "running" \
         --arg workers "$WORKERS" \
-        '{limit: $limit, output: $output, data_dir: $data_dir, max_files: $max_files, convert_to_selfies: $convert_to_selfies, selfies_output: $selfies_output, pid: $pid, start_time: $start_time, status: $status, workers: $workers}' \
+        '{output: $output, data_dir: $data_dir, extract_types: $extract_types, pid: $pid, start_time: $start_time, status: $status, workers: $workers}' \
         > "$STATE_FILE"
 }
 
 update_state_status() {
     local status="$1"
     if [ -f "$STATE_FILE" ]; then
-        # Use jq to update status if available, otherwise use sed
         if command -v jq &> /dev/null; then
             jq ".status = \"$status\"" "$STATE_FILE" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
         else
             sed -i "s/\"status\": \"[^\"]*\"/\"status\": \"$status\"/" "$STATE_FILE"
         fi
     fi
+}
+
+# =============================================================================
+# Download Functions
+# =============================================================================
+
+download_file_with_aria2c() {
+    local url="$1"
+    local filename="$2"
+    local target_dir="$3"
+    local max_retries=3
+    
+    local filepath="$target_dir/$filename"
+    
+    # Check if download is complete by looking for aria2 control file
+    # If .aria2 file exists, download was incomplete
+    if [ -f "$filepath" ] && [ ! -f "$filepath.aria2" ]; then
+        log_info "File '$filename' already exists and appears complete, skipping download."
+        return 0
+    elif [ -f "$filepath.aria2" ]; then
+        log_info "Resuming incomplete download of '$filename'..."
+    fi
+    
+    log_info "Downloading $filename..."
+    local cmd=(
+        aria2c
+        --dir="$target_dir"
+        --out="$filename"
+        --max-tries="$max_retries"
+        --retry-wait=1
+        --timeout=600
+        --connect-timeout=30
+        --continue=true
+        --max-connection-per-server=16
+        --split=16
+        --min-split-size=1M
+        --max-download-limit=0
+        --disable-ipv6=false
+        --enable-http-pipelining=true
+        --http-accept-gzip=true
+        --reuse-uri=true
+        --max-concurrent-downloads=5
+        "$url"
+    )
+    
+    if [ "$DEBUG_MODE" = true ]; then
+        cmd+=(--summary-interval=1)
+    fi
+    
+    if "${cmd[@]}"; then
+        log_success "Successfully downloaded $filename"
+        return 0
+    else
+        log_error "Failed to download $filename"
+        return 1
+    fi
+}
+
+download_crossdock_files() {
+    local cache_dir="$1"
+    mkdir -p "$cache_dir"
+    
+    log_info "Downloading CrossDock2020 dataset files..."
+    
+    # Download main structures archive
+    if ! download_file_with_aria2c "$CROSSDOCK_BASE_URL/$STRUCTURES_FILE" "$STRUCTURES_FILE" "$cache_dir"; then
+        log_error "Failed to download structures archive"
+        return 1
+    fi
+    
+    # Extract structures archive to crossdocked folder
+    local extract_dir="$cache_dir/crossdocked"
+    mkdir -p "$extract_dir"
+    log_info "Extracting structures archive to $extract_dir (this may take a while)..."
+    if tar -xzf "$cache_dir/$STRUCTURES_FILE" -C "$extract_dir"; then
+        log_success "Structures archive extracted successfully to crossdocked/"
+    else
+        log_error "Failed to extract structures archive"
+        return 1
+    fi
+    
+    # Download types file if requested
+    if [ "$EXTRACT_TYPES" = true ]; then
+        if ! download_file_with_aria2c "$CROSSDOCK_BASE_URL/$TYPES_FILE" "$TYPES_FILE" "$cache_dir"; then
+            log_error "Failed to download types file"
+            return 1
+        fi
+        
+        # Extract types file
+        log_info "Extracting types file..."
+        mkdir -p "$cache_dir/types"
+        if tar -xzf "$cache_dir/$TYPES_FILE" -C "$cache_dir/types"; then
+            log_success "Types file extracted successfully"
+        else
+            log_error "Failed to extract types file"
+            return 1
+        fi
+    fi
+    
+    log_success "All CrossDock2020 files downloaded and extracted successfully"
+    return 0
 }
 
 # =============================================================================
@@ -213,7 +344,6 @@ monitor_pipeline() {
     log_info "Monitoring pipeline process (PID: $pid). The script will show its own progress."
     log_info "Logs are being written to: $PROGRESS_LOG"
     
-    # Wait for the background process to complete
     wait "$pid"
     return $?
 }
@@ -227,29 +357,17 @@ show_completion_stats() {
     local seconds=$((duration % 60))
     
     # Try to get final count from logs
-    TOTAL_SMILES=$(grep -o "Total SMILES collected: [0-9,]*" "$PROGRESS_LOG" | tail -1 | grep -o "[0-9,]*" | tr -d ',' || echo 0)
-    
-    local avg_rate=0
-    if [ "$duration" -gt 0 ]; then
-        avg_rate=$((TOTAL_SMILES * 3600 / duration))
-    fi
-    
-    local selfies_file="${OUTPUT_SMILES%.*}_selfies.csv"
-    local selfies_info="SELFIES file: $selfies_file"
-    if [ "$CONVERT_TO_SELFIES" = false ]; then
-        selfies_info="SELFIES conversion was disabled."
-    fi
+    local total_pairs
+    total_pairs=$(grep -o "Generated [0-9,]* protein-ligand pairs" "$PROGRESS_LOG" | tail -1 | grep -o "[0-9,]*" | tr -d ',' || echo 0)
 
     echo -e "${GREEN}"
     echo "╔══════════════════════════════════════════════════════════════════════════════╗"
     echo "║                             PIPELINE COMPLETED                             ║"
     echo "╠══════════════════════════════════════════════════════════════════════════════╣"
-    printf "║ Molecules Collected: %'12d                                      ║\n" "$TOTAL_SMILES"
-    printf "║ Total Duration:      %02d:%02d:%02d                                           ║\n" "$hours" "$minutes" "$seconds"
-    printf "║ Average Rate:        %'12.0f molecules/hour                         ║\n" "$avg_rate"
-    printf "║ %-66s ║\n" "$selfies_info"
+    printf "║ Protein-Ligand Pairs:   %'12d                                      ║\n" "$total_pairs"
+    printf "║ Total Duration:          %02d:%02d:%02d                                           ║\n" "$hours" "$minutes" "$seconds"
     echo "╠══════════════════════════════════════════════════════════════════════════════╣"
-    echo "║ SMILES file: $OUTPUT_SMILES                                                   ║"
+    echo "║ Output CSV: $OUTPUT_CSV                                                      ║"
     echo "║ Full logs are available in: $LOG_DIR                                 ║"
     echo "╚══════════════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -261,28 +379,15 @@ show_completion_stats() {
 
 start_pipeline() {
     if [ "$RESUME" = false ]; then
-        log_info "Preparing for new pipeline run by cleaning logs, output, and state files."
+        log_info "Preparing for new pipeline run by cleaning logs and state files (--no-resume)."
         
-        # Clean directories and state file safely to ensure a fresh start.
+        # Clean state and logs
         rm -f "$STATE_FILE"
         find "$LOG_DIR" -mindepth 1 -delete 2>/dev/null || true
         
         local output_dir="$DATA_DIR/output"
         if [ -d "$output_dir" ]; then
-            # Determine files to delete
-            local smiles_output_path="$output_dir/$OUTPUT_SMILES"
-
-            local selfies_name="$OUTPUT_SELFIES"
-            if [ -z "$selfies_name" ]; then
-                selfies_name="${OUTPUT_SMILES%.*}_selfies.csv"
-            fi
-            local selfies_output_path="$output_dir/$selfies_name"
-            
-            local failures_output_path="$output_dir/${OUTPUT_SMILES%.*}_failures.txt"
-            local stats_output_path="$output_dir/${OUTPUT_SMILES%.*}_conversion_stats.json"
-
-            # Delete specific files
-            rm -f "$smiles_output_path" "$selfies_output_path" "$failures_output_path" "$stats_output_path"
+            rm -f "$output_dir/positive_pairs.csv" "$output_dir/negative_pairs.csv"
         fi
         
         log_info "Previous run artifacts have been cleared."
@@ -292,53 +397,31 @@ start_pipeline() {
 
     START_TIME=$(date +%s)
 
-    echo -e "${GREEN}Starting PubChem Data Pipeline${NC}"
+    echo -e "${GREEN}Starting CrossDock2020 Dataset Pipeline${NC}"
     echo "--------------------------------------------------"
-    log_info "Download method: $DOWNLOAD_METHOD"
-    log_info "Target molecules: $(printf "%'d" "$LIMIT")"
-    log_info "SMILES output file: $OUTPUT_SMILES"
+    log_info "Output CSV file: $OUTPUT_CSV"
+    log_info "Workers: $WORKERS"
+    log_info "Extract types file: $EXTRACT_TYPES"
     
-    if [ "$CONVERT_TO_SELFIES" = true ]; then
-        local selfies_name="$OUTPUT_SELFIES"
-        if [ -z "$selfies_name" ]; then
-            selfies_name="${OUTPUT_SMILES%.*}_selfies.csv"
-        fi
-        log_info "SELFIES conversion: ENABLED -> $selfies_name"
-    else
-        log_info "SELFIES conversion: DISABLED"
-    fi
+    local data_cache_dir="$DATA_DIR/crossdocked"
+    check_disk_space "$data_cache_dir" 10  # CrossDock2020 is smaller than PubChem
     
-    local data_cache_dir="$DATA_DIR/pubchem"
-    if [ "$DOWNLOAD_METHOD" = "usearch" ]; then
-        log_info "Data source: AWS S3 (usearch-molecules)"
-        mkdir -p "$data_cache_dir"
-        check_disk_space "$data_cache_dir" 35
-        
-        log_info "Syncing PubChem Parquet files from AWS S3... (this may take a while)"
-        if ! aws s3 sync --no-sign-request "s3://usearch-molecules/data/pubchem/parquet/" "$data_cache_dir"; then
-            log_error "Failed to download data from S3. Check your connection and AWS CLI setup."
-            exit 1
-        fi
-        log_success "S3 sync complete."
-
-    else # ftp
-        check_disk_space "$data_cache_dir" 50
+    # Download files
+    if ! download_crossdock_files "$data_cache_dir"; then
+        log_error "Failed to download CrossDock2020 files"
+        exit 1
     fi
     
     # Construct Python command
     local python_cmd=(
         python3 "$PYTHON_SCRIPT"
-        --method "$DOWNLOAD_METHOD"
-        --limit "$LIMIT"
-        --output "$OUTPUT_SMILES"
+        --output "$OUTPUT_CSV"
         --data-dir "$DATA_DIR"
         --workers "$WORKERS"
+        --debug  # Enable debug mode by default for troubleshooting
     )
-    [ "$DEBUG_MODE" = true ] && python_cmd+=(--debug)
-    [ -n "$MAX_FILES" ] && python_cmd+=(--max-files "$MAX_FILES")
     [ "$CLEANUP" = true ] && python_cmd+=(--cleanup)
-    [ "$CONVERT_TO_SELFIES" = false ] && python_cmd+=(--no-selfies)
-    [ -n "$OUTPUT_SELFIES" ] && python_cmd+=(--selfies-output "$OUTPUT_SELFIES")
+    [ "$EXTRACT_TYPES" = false ] && python_cmd+=(--no-extract-types)
     
     # Execute Python pipeline in the background and monitor it
     "${python_cmd[@]}" 2>&1 | tee -a "$PROGRESS_LOG" &
@@ -382,7 +465,7 @@ show_status() {
     local status; status=$(jq -r '.status // "unknown"' "$STATE_FILE")
     local pid; pid=$(jq -r '.pid // "unknown"' "$STATE_FILE")
     
-    jq -r '"Status: \(.status)\nTarget SMILES: \(.limit|tonumber|tostring|gsub(",";"")|tonumber|tostring)\nProcess ID: \(.pid)\nWorkers: \(.workers)"' "$STATE_FILE"
+    jq -r '"Status: \(.status)\nProcess ID: \(.pid)\nWorkers: \(.workers)\nOutput: \(.output)"' "$STATE_FILE"
     
     if [ "$pid" != "unknown" ] && kill -0 "$pid" 2>/dev/null; then
         echo -e "${GREEN}Process is currently running.${NC}"
@@ -415,7 +498,6 @@ kill_pipeline() {
     
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
         log_info "Killing pipeline process (PID: $pid) and its children..."
-        # Kill the entire process group to stop child processes (like aria2c)
         kill -TERM -"$pid" 2>/dev/null || true
         sleep 2
         
@@ -426,7 +508,7 @@ kill_pipeline() {
         
         update_state_status "killed"
         log_success "Pipeline process terminated."
-    else
+    else 
         log_warn "No running pipeline process found to kill."
     fi
 }
@@ -453,27 +535,22 @@ main() {
     # Parse command-line arguments
     while [[ $# -gt 0 ]]; do
         case $1 in
-            -l|--limit) LIMIT="$2"; shift 2 ;;
-            -o|--output) OUTPUT_SMILES="$2"; shift 2 ;;
+            -o|--output) OUTPUT_CSV="$2"; shift 2 ;;
             -d|--data-dir) DATA_DIR="$2"; shift 2 ;;
-            -m|--max-files) MAX_FILES="$2"; shift 2 ;;
             --workers) WORKERS="$2"; shift 2 ;;
             -r|--resume) RESUME=true; shift ;;
             -R|--no-resume) RESUME=false; shift ;;
             -C|--cleanup) CLEANUP=true; shift ;;
-            --no-selfies) CONVERT_TO_SELFIES=false; shift ;;
-            --selfies-output) OUTPUT_SELFIES="$2"; shift 2 ;;
+            --no-extract-types) EXTRACT_TYPES=false; shift ;;
             -s|--status) show_status; exit 0 ;;
             -k|--kill) kill_pipeline; exit 0 ;;
             --debug) DEBUG_MODE=true; shift ;;
-            --usearch) DOWNLOAD_METHOD="usearch"; shift ;;
-            --ftp) DOWNLOAD_METHOD="ftp"; shift ;;
             -h|--help) show_usage; exit 0 ;;
             *) log_error "Unknown option: $1"; show_usage; exit 1 ;;
         esac
     done
     
-    mkdir -p "$LOG_DIR" "$DATA_DIR/pubchem" "$DATA_DIR/output"
+    mkdir -p "$LOG_DIR" "$DATA_DIR/crossdocked" "$DATA_DIR/output"
     
     show_banner
     check_dependencies
