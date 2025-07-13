@@ -220,22 +220,43 @@ class Attention(nn.Module):
         v = v.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         
         if self.flash_available:
-            is_causal = attention_mask is None
-            attn_mask = self._get_alibi_bias(seq_len, x.device) if self.use_alibi else attention_mask
-            if self.use_alibi and attention_mask is not None:
-                attn_mask = attn_mask + attention_mask
+            # We must construct the final attention mask manually because the `is_causal`
+            # flag in `scaled_dot_product_attention` is mutually exclusive with `attn_mask`.
+            final_attn_mask = None
+            if self.use_alibi:
+                # ALiBi is an additive float mask that replaces the boolean causal mask.
+                final_attn_mask = self._get_alibi_bias(seq_len, x.device)
+                if attention_mask is not None:
+                    # Combine with padding mask (0 for pad, so 1-mask = 1 for pad)
+                    padding_mask_float = (1.0 - attention_mask) * -1e9
+                    final_attn_mask = final_attn_mask.unsqueeze(0) + padding_mask_float.view(batch_size, 1, 1, seq_len)
+            else:
+                # Build a boolean mask. True means "do not attend".
+                causal_mask = torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device), diagonal=1)
+                final_attn_mask = causal_mask.unsqueeze(0).unsqueeze(0) # Expand to (1, 1, T, T)
+                if attention_mask is not None:
+                    padding_mask = (attention_mask == 0).unsqueeze(1).unsqueeze(2) # (B, 1, 1, T)
+                    final_attn_mask = final_attn_mask | padding_mask # Combine causal and padding
 
             y = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask, dropout_p=self.attn_dropout.p if self.training else 0.0, is_causal=is_causal and not self.use_alibi
+                q, k, v, attn_mask=final_attn_mask, dropout_p=self.attn_dropout.p if self.training else 0.0
             )
         else:
             # Manual implementation for fallback
             attn_weights = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.head_dim)
+            
+            # Build additive mask for manual implementation
+            final_additive_mask = None
             if self.use_alibi:
-                attn_weights += self._get_alibi_bias(seq_len, x.device)
+                final_additive_mask = self._get_alibi_bias(seq_len, x.device)
+            else:
+                final_additive_mask = torch.triu(torch.full((seq_len, seq_len), -1e9, device=x.device), diagonal=1)
 
             if attention_mask is not None:
-                attn_weights = attn_weights + attention_mask
+                padding_mask_float = (1.0 - attention_mask) * -1e9
+                final_additive_mask = final_additive_mask + padding_mask_float.view(batch_size, 1, 1, seq_len)
+            
+            attn_weights = attn_weights + final_additive_mask
             
             attn_weights = F.softmax(attn_weights, dim=-1)
             attn_weights = self.attn_dropout(attn_weights)
@@ -261,19 +282,34 @@ class FeedForward(nn.Module):
         return x
 
 class DecoderBlock(nn.Module):
-    """ A single Transformer Decoder block with Pre-Layer Normalization. """
-    def __init__(self, config: ModelConfig):
+    """ A single Transformer Decoder block with Pre-Layer Normalization and Stochastic Depth. """
+    def __init__(self, config: ModelConfig, layer_idx: int):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.d_model, eps=config.layer_norm_eps)
         self.attn = Attention(config)
         self.ln_2 = nn.LayerNorm(config.d_model, eps=config.layer_norm_eps)
         self.mlp = FeedForward(config)
+        
+        # Stochastic Depth (drop path)
+        # Linearly increase drop prob from 0 to the target prob over layers
+        self.drop_path_prob = config.stochastic_depth_prob * (layer_idx / (config.n_layers - 1))
+
+    def drop_path(self, x: torch.Tensor, drop_prob: float = 0.) -> torch.Tensor:
+        """Drop connections with a given probability."""
+        if drop_prob == 0. or not self.training:
+            return x
+        keep_prob = 1 - drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)  # (B, 1, 1, ...)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()  # binarize
+        output = x.div(keep_prob) * random_tensor
+        return output
 
     def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # Pre-LN: Norm -> Attention -> Add
-        x = x + self.attn(self.ln_1(x), attention_mask=attention_mask)
-        # Pre-LN: Norm -> MLP -> Add
-        x = x + self.mlp(self.ln_2(x))
+        # Pre-LN: Norm -> Attention -> Add, with drop path
+        x = x + self.drop_path(self.attn(self.ln_1(x), attention_mask=attention_mask), self.drop_path_prob)
+        # Pre-LN: Norm -> MLP -> Add, with drop path
+        x = x + self.drop_path(self.mlp(self.ln_2(x)), self.drop_path_prob)
         return x
 
 class SELFIESGPTDecoder(nn.Module):
@@ -291,7 +327,7 @@ class SELFIESGPTDecoder(nn.Module):
         self.branch_proj = nn.Linear(config.branch_depth_embedding_dim, config.d_model, bias=False)
 
         self.drop = nn.Dropout(config.dropout)
-        self.h = nn.ModuleList([DecoderBlock(config) for _ in range(config.n_layers)])
+        self.h = nn.ModuleList([DecoderBlock(config, i) for i in range(config.n_layers)])
         self.ln_f = nn.LayerNorm(config.d_model, eps=config.layer_norm_eps)
         
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
@@ -344,17 +380,10 @@ class SELFIESGPTDecoder(nn.Module):
             
         hidden_states = self.drop(hidden_states)
 
-        if attention_mask is not None:
-            # Pytorch's scaled_dot_product_attention expects mask where True indicates masking
-            # But standard huggingface mask has 1 for not masked, 0 for masked.
-            # And for alibi, we need additive mask. Let's create it here.
-            causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=input_ids.device)).view(1, 1, seq_len, seq_len)
-            extended_attention_mask = attention_mask[:, None, None, :]
-            extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
-            attention_mask = extended_attention_mask + (1.0 - causal_mask) * -10000.0
-
+        # The attention_mask from the dataloader is a padding mask (1 for keep, 0 for pad).
+        # It will be handled correctly inside the Attention module.
         for block in self.h:
-            hidden_states = block(hidden_states, attention_mask=attention_mask if not self.config.use_alibi else None)
+            hidden_states = block(hidden_states, attention_mask=attention_mask)
         
         hidden_states = self.ln_f(hidden_states)
         logits = self.lm_head(hidden_states)

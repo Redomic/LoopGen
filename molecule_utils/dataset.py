@@ -1,5 +1,5 @@
 import torch
-from torch.utils.data import Dataset, IterableDataset
+from torch.utils.data import Dataset, IterableDataset, get_worker_info
 from typing import Optional, Iterator
 import pandas as pd
 import math
@@ -44,11 +44,11 @@ class SELFIESDataset(IterableDataset):
         if split == 'train':
             self.start_line = 1 # Skip header
             self.end_line = math.floor(total_lines * split_ratio)
-        elif split == 'validation':
+        elif split == 'val':
             self.start_line = math.floor(total_lines * split_ratio) + 1
             self.end_line = total_lines + 1
         else:
-            raise ValueError("split must be 'train' or 'validation'")
+            raise ValueError("split must be 'train' or 'val'")
         
         # For iterable datasets, the length is an estimate
         self.length = self.end_line - self.start_line
@@ -58,21 +58,34 @@ class SELFIESDataset(IterableDataset):
 
     def _line_iterator(self) -> Iterator[str]:
         """An internal iterator to stream lines from the correct split of the CSV."""
+        worker_info = get_worker_info()
+
         try:
+            num_rows_to_read = self.end_line - self.start_line
+            if num_rows_to_read <= 0:
+                return
+
             chunk_iterator = pd.read_csv(
                 self.file_path,
                 usecols=['SELFIES'],
                 chunksize=10000,
                 header=0,
                 skiprows=range(1, self.start_line),
+                nrows=num_rows_to_read,
                 on_bad_lines='skip'
             )
-            line_num = self.start_line - 1
+            
+            line_idx = -1
+            # The `nrows` argument correctly constrains the reader to the intended split.
             for chunk in chunk_iterator:
                 for selfies_string in chunk['SELFIES']:
-                    line_num += 1
-                    if line_num >= self.end_line:
-                        return
+                    line_idx += 1
+
+                    # If in a worker process, skip lines not assigned to this worker.
+                    if worker_info is not None:
+                        if line_idx % worker_info.num_workers != worker_info.id:
+                            continue
+                    
                     if isinstance(selfies_string, str):
                         yield selfies_string
         except FileNotFoundError:

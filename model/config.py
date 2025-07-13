@@ -27,7 +27,7 @@ class ModelConfig:
     use_cache: bool = True              # Key-value caching
     tie_word_embeddings: bool = False   # Tie input/output embeddings
     
-    # SELFIES-specific features
+    # SELFIES-specific features (now disabled by default for robustness)
     use_grammar_constraint: bool = False
     branch_depth_embedding_dim: int = 64
     max_branch_depth: int = 16
@@ -38,6 +38,7 @@ class ModelConfig:
     warmup_steps: int = 2000
     max_steps: int = 50000
     weight_decay: float = 0.1
+    grad_clip: float = 1.0
     
     # Advanced features (for future implementation)
     use_early_exit: bool = False
@@ -76,14 +77,29 @@ class ModelConfig:
 
     @classmethod
     def large_config(cls) -> 'ModelConfig':
-        """Returns large model configuration."""
+        """Returns large model configuration, inspired by recent research."""
         return cls(
             vocab_size=512,
-            d_model=1024,
+            d_model=1280,
             n_heads=16,
-            n_layers=16,
-            d_ff=4096,
-            max_seq_len=256
+            n_layers=24,
+            d_ff=1280 * 4,
+            max_seq_len=256,
+            stochastic_depth_prob=0.1  # Add regularization for the larger model
+        )
+
+    @classmethod
+    def small_config(cls) -> 'ModelConfig':
+        """Returns a small, robust model configuration for rapid prototyping."""
+        return cls(
+            vocab_size=512,
+            d_model=256,
+            n_heads=4,
+            n_layers=6,
+            d_ff=1024,
+            max_seq_len=256,
+            dropout=0.1,
+            stochastic_depth_prob=0.05
         )
 
 # Legacy compatibility functions
@@ -93,4 +109,8 @@ def get_standard_config() -> ModelConfig:
 
 def get_large_config() -> ModelConfig:
     """Returns the large model configuration."""
-    return ModelConfig.large_config() 
+    return ModelConfig.large_config()
+
+def get_small_config() -> ModelConfig:
+    """Returns the small model configuration."""
+    return ModelConfig.small_config() 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Training script for SELFIES GPT decoder with proper vocabulary building and advanced generation.
+Unified training script for SELFIES GPT decoder.
+Supports contrastive pre-training and generative fine-tuning.
 """
 
 import argparse
@@ -22,599 +23,451 @@ from tqdm import tqdm
 
 from model.config import ModelConfig
 from model.decoder import SELFIESGPTDecoder
+from model.contrastive_model import ContrastiveSELFIESModel
 from molecule_utils.tokenizer import SELFIETokenizer
 from molecule_utils.dataset import SELFIESDataset, FixedSizeSELFIESDataset, collate_fn, count_lines
+from molecule_utils.augmentation import SELFIESAugmenter, create_contrastive_batch
+
+# region: Contrastive Learning Functions
+# ==============================================================================
+
+def _contrastive_collate_fn(batch, tokenizer, augmenter, num_augmentations=2):
+    """
+    Custom collate function for contrastive learning.
+    Creates augmented pairs and handles batching.
+    """
+    selfies_strings = [tokenizer.decode(t.tolist(), skip_special_tokens=True) for t in batch]
+    
+    augmented_strings, labels = create_contrastive_batch(
+        selfies_strings, augmenter, num_augmentations
+    )
+    
+    max_len = max(len(tokenizer.encode(s, add_special_tokens=True)) for s in augmented_strings)
+    
+    input_ids = []
+    for s in augmented_strings:
+        encoded = tokenizer.encode(s, add_special_tokens=True)
+        encoded.extend([tokenizer.pad_token_id] * (max_len - len(encoded)))
+        input_ids.append(torch.tensor(encoded[:max_len], dtype=torch.long))
+    
+    return {
+        'input_ids': torch.stack(input_ids),
+        'attention_mask': (torch.stack(input_ids) != tokenizer.pad_token_id).long(),
+        'labels': torch.tensor(labels, dtype=torch.long)
+    }
 
 
-def get_learning_rate(step: int, config: ModelConfig) -> float:
-    """Learning rate schedule with warmup and cosine annealing."""
-    warmup_steps = config.warmup_steps
-    max_steps = config.max_steps
-    
-    if step < warmup_steps:
-        return config.learning_rate * step / warmup_steps
-    
-    if step > max_steps:
-        return config.min_learning_rate
-    
-    decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-    return config.min_learning_rate + coeff * (config.learning_rate - config.min_learning_rate)
-
-
-def estimate_mfu(model: nn.Module, config: ModelConfig, dt: float, fwdbwd_per_iter: int) -> float:
-    """Estimate model flops utilization."""
-    N = sum(p.numel() for p in model.parameters())
-    L, H, Q, T = config.n_layers, config.n_heads, config.d_model // config.n_heads, config.max_seq_len
-    flops_per_token = 6 * N + 12 * L * H * Q * T
-    flops_per_fwdbwd = flops_per_token * T
-    flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
-    flops_achieved = flops_per_iter * (1.0 / dt)
-    
-    # A100 theoretical peak is 312 TFLOPS with sparsity
-    flops_promised = 312e12
-    mfu = flops_achieved / flops_promised
-    return mfu
-
-
-def validate_model(model: nn.Module, val_dataloader: DataLoader, device: torch.device, 
-                  use_amp: bool = False) -> float:
-    """Run validation and return average loss."""
-    model.eval()
-    total_loss = 0.0
-    num_batches = 0
-    
-    with torch.no_grad():
-        for batch in val_dataloader:
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            
-            if use_amp:
-                with autocast(device.type):
-                    outputs = model(input_ids, attention_mask=attention_mask)
-                    # Shift for causal LM loss
-                    shift_logits = outputs[:, :-1, :].contiguous()
-                    shift_labels = input_ids[:, 1:].contiguous()
-                    
-                    loss = nn.functional.cross_entropy(
-                        shift_logits.view(-1, shift_logits.size(-1)), 
-                        shift_labels.view(-1), 
-                        ignore_index=0  # PAD token
-                    )
-            else:
-                outputs = model(input_ids, attention_mask=attention_mask)
-                shift_logits = outputs[:, :-1, :].contiguous()
-                shift_labels = input_ids[:, 1:].contiguous()
-                
-                loss = nn.functional.cross_entropy(
-                    shift_logits.view(-1, shift_logits.size(-1)), 
-                    shift_labels.view(-1), 
-                    ignore_index=0
-                )
-            
-            total_loss += loss.item()
-            num_batches += 1
-    
+def _train_contrastive_epoch(model, loader, optimizer, scaler, device, args):
+    """Train one epoch of contrastive learning."""
     model.train()
-    return total_loss / num_batches if num_batches > 0 else float('inf')
-
-
-def generate_molecules(model: nn.Module, tokenizer: SELFIETokenizer, device: torch.device,
-                      num_molecules: int = 5, max_length: int = 128, temperature: float = 1.0,
-                      top_k: int = 50, top_p: float = 0.9, repetition_penalty: float = 1.1,
-                      use_grammar_constraints: bool = True) -> List[str]:
-    """Generate molecules with advanced sampling and optional grammar constraints."""
-    model.eval()
-    generated_molecules = []
+    totals = {'loss': 0, 'cont': 0, 'recon': 0, 'div': 0}
     
-    with torch.no_grad():
-        for i in range(num_molecules):
-            # Start with BOS token
-            current_sequence = [tokenizer.bos_token_id]
-            input_ids = torch.tensor([current_sequence], device=device)
-            
-            for _ in range(max_length):
-                # Get model predictions
-                outputs = model(input_ids, apply_constraints=use_grammar_constraints)
-                logits = outputs[0, -1, :] if isinstance(outputs, torch.Tensor) else outputs['logits'][0, -1, :]
-                
-                # Apply repetition penalty
-                if repetition_penalty != 1.0:
-                    for token_id in set(current_sequence):
-                        if logits[token_id] < 0:
-                            logits[token_id] *= repetition_penalty
-                        else:
-                            logits[token_id] /= repetition_penalty
-                
-                # Apply grammar constraints if enabled
-                if use_grammar_constraints:
-                    valid_tokens = tokenizer.get_valid_next_tokens(current_sequence)
-                    
-                    mask = torch.full_like(logits, float('-inf'))
-                    for token_id in valid_tokens:
-                        if token_id < len(logits):
-                            mask[token_id] = 0
-                    logits = logits + mask
-                
-                # Temperature scaling
-                if temperature != 1.0:
-                    logits = logits / temperature
-                
-                # Top-k filtering
-                if top_k > 0:
-                    top_k_actual = min(top_k, logits.size(-1))
-                    indices_to_remove = logits < torch.topk(logits, top_k_actual)[0][..., -1, None]
-                    logits[indices_to_remove] = float('-inf')
-                
-                # Top-p (nucleus) filtering
-                if top_p < 1.0:
-                    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                    cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-                    
-                    sorted_indices_to_remove = cumulative_probs > top_p
-                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                    sorted_indices_to_remove[..., 0] = 0
-                    
-                    indices_to_remove = sorted_indices[sorted_indices_to_remove]
-                    logits[indices_to_remove] = float('-inf')
-                
-                # Sample next token
-                probs = torch.softmax(logits, dim=-1)
-                next_token_id = torch.multinomial(probs, 1).item()
-                
-                # Check for EOS or add token
-                if next_token_id == tokenizer.eos_token_id:
-                    break
-                
-                current_sequence.append(next_token_id)
-                input_ids = torch.cat([input_ids, torch.tensor([[next_token_id]], device=device)], dim=1)
-            
-            # Decode the sequence
-            molecule = tokenizer.decode(current_sequence, skip_special_tokens=True)
-            generated_molecules.append(molecule)
-    
-    model.train()
-    return generated_molecules
-
-
-def build_or_load_tokenizer(data_path: str, checkpoint_dir: Path) -> SELFIETokenizer:
-    """Build tokenizer vocabulary from training data or load from cache in checkpoints dir."""
-    vocab_cache_path = checkpoint_dir / "vocab_cache.json"
-    
-    print("Setting up tokenizer...")
-    
-    # Check if cached vocabulary exists in checkpoints
-    if vocab_cache_path.exists():
-        print(f"Loading cached vocabulary from {vocab_cache_path}")
-        tokenizer = SELFIETokenizer(vocab_file=str(vocab_cache_path))
-    else:
-        print(f"No vocabulary cache found. Building vocabulary from training data: {data_path}")
-        print("This may take a few minutes for large datasets...")
-        
-        # Create checkpoints directory if it doesn't exist
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Build vocabulary from training data
-        tokenizer = SELFIETokenizer(training_data_path=data_path)
-        
-        # Save vocabulary to checkpoints directory
-        tokenizer._save_vocab(tokenizer.vocab, str(vocab_cache_path))
-        print(f"Vocabulary automatically saved to {vocab_cache_path}")
-        
-    print(f"Tokenizer vocabulary size: {tokenizer.vocab_size}")
-    print(f"Sample vocabulary tokens: {tokenizer.vocab[:20]}")
-    
-    return tokenizer
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Train SELFIES GPT decoder")
-    
-    # Data arguments
-    parser.add_argument("--data_path", type=str, required=True, 
-                       help="Path to training CSV file")
-    parser.add_argument("--val_split", type=float, default=0.01,
-                       help="Validation split ratio")
-    parser.add_argument("--val_set_size", type=int, default=10000,
-                       help="Fixed validation set size")
-    parser.add_argument("--shuffle_buffer_size", type=int, default=10000,
-                       help="Size of shuffle buffer for streaming data")
-    
-    # Model arguments
-    parser.add_argument("--model_size", type=str, default="standard", choices=["standard", "large"],
-                       help="Model size configuration")
-    parser.add_argument("--max_seq_len", type=int, default=256,
-                       help="Maximum sequence length")
-    
-    # Training arguments
-    parser.add_argument("--batch_size", type=int, default=32,
-                       help="Training batch size")
-    parser.add_argument("--max_steps", type=int, default=50000,
-                       help="Maximum training steps")
-    parser.add_argument("--learning_rate", type=float, default=3e-4,
-                       help="Peak learning rate")
-    parser.add_argument("--warmup_steps", type=int, default=2000,
-                       help="Warmup steps")
-    parser.add_argument("--weight_decay", type=float, default=0.1,
-                       help="Weight decay")
-    parser.add_argument("--grad_accumulation_steps", type=int, default=1,
-                       help="Gradient accumulation steps")
-    parser.add_argument("--grad_clip", type=float, default=1.0,
-                       help="Gradient clipping value")
-    
-    # System arguments
-    parser.add_argument("--device", type=str, default="auto",
-                       help="Device to use (cuda/cpu/auto)")
-    parser.add_argument("--use_amp", action="store_true", 
-                       help="Use automatic mixed precision")
-    parser.add_argument("--use_compile", action="store_true",
-                       help="Use torch.compile for optimization")
-    parser.add_argument("--num_workers", type=int, default=4,
-                       help="Number of dataloader workers")
-    
-    # Evaluation arguments
-    parser.add_argument("--eval_interval", type=int, default=500,
-                       help="Evaluation interval")
-    parser.add_argument("--eval_iters", type=int, default=100,
-                       help="Number of evaluation iterations")
-    parser.add_argument("--generate_interval", type=int, default=2000,
-                       help="Generation interval")
-    parser.add_argument("--num_generated", type=int, default=5,
-                       help="Number of molecules to generate")
-    
-    # Generation arguments
-    parser.add_argument("--temperature", type=float, default=0.8,
-                       help="Sampling temperature")
-    parser.add_argument("--top_k", type=int, default=50,
-                       help="Top-k sampling")
-    parser.add_argument("--top_p", type=float, default=0.9,
-                       help="Top-p (nucleus) sampling")
-    parser.add_argument("--repetition_penalty", type=float, default=1.1,
-                       help="Repetition penalty")
-    parser.add_argument("--use_grammar_constraints", action="store_true",
-                       help="Use grammar constraints during generation")
-    
-    # I/O arguments
-    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints",
-                       help="Checkpoint directory")
-    parser.add_argument("--resume_from", type=str, default=None,
-                       help="Resume training from checkpoint")
-    parser.add_argument("--save_interval", type=int, default=5000,
-                       help="Checkpoint save interval")
-    
-    # Debug arguments
-    parser.add_argument("--validate_split_and_exit", action="store_true",
-                       help="Validate data split and exit")
-    
-    args = parser.parse_args()
-    
-    # Setup device
-    if args.device == "auto":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(args.device)
-    print(f"Using device: {device}")
-    
-    # Build or load tokenizer
-    checkpoint_dir = Path(args.checkpoint_dir)
-    tokenizer = build_or_load_tokenizer(args.data_path, checkpoint_dir)
-    
-    # Create model configuration
-    if args.model_size == "standard":
-        config = ModelConfig.standard_config()
-    else:
-        config = ModelConfig.large_config()
-    
-    # Update config with CLI args
-    config.vocab_size = tokenizer.vocab_size
-    config.max_seq_len = args.max_seq_len
-    config.learning_rate = args.learning_rate
-    config.warmup_steps = args.warmup_steps
-    config.weight_decay = args.weight_decay
-    config.max_steps = args.max_steps
-    
-    print(f"Model configuration: {config}")
-    
-    # Validate split if requested
-    if args.validate_split_and_exit:
-        print("Validating data split...")
-        total_lines = count_lines(args.data_path)
-        train_dataset = SELFIESDataset(
-            args.data_path, tokenizer, config.max_seq_len, total_lines,
-            split='train', split_ratio=1.0 - (args.val_set_size/total_lines),
-            shuffle_buffer_size=args.shuffle_buffer_size
-        )
-        val_dataset = FixedSizeSELFIESDataset(
-            args.data_path, tokenizer, config.max_seq_len,
-            num_samples=args.val_set_size, total_lines=total_lines
-        )
-        
-        print(f"Training dataset created successfully")
-        print(f"Validation dataset size: {len(val_dataset)}")
-        
-        # Show sample data
-        train_loader = DataLoader(train_dataset, batch_size=2, num_workers=0, collate_fn=partial(collate_fn, pad_token_id=tokenizer.pad_token_id))
-        val_loader = DataLoader(val_dataset, batch_size=2, num_workers=0, collate_fn=partial(collate_fn, pad_token_id=tokenizer.pad_token_id))
-        
-        print("\nSample training batch:")
-        train_batch = next(iter(train_loader))
-        for i, seq in enumerate(train_batch['input_ids'][:2]):
-            decoded = tokenizer.decode(seq.tolist(), skip_special_tokens=True)
-            print(f"  Training sample {i}: {decoded[:100]}...")
-        
-        print("\nSample validation batch:")
-        val_batch = next(iter(val_loader))
-        for i, seq in enumerate(val_batch['input_ids'][:2]):
-            decoded = tokenizer.decode(seq.tolist(), skip_special_tokens=True)
-            print(f"  Validation sample {i}: {decoded[:100]}...")
-        
-        print("\nValidation complete. Exiting.")
-        return
-    
-    # Create datasets
-    print("Creating datasets...")
-    total_lines = count_lines(args.data_path)
-    print(f"Total lines in dataset: {total_lines:,}")
-    
-    train_dataset = SELFIESDataset(
-        args.data_path, tokenizer, config.max_seq_len, total_lines,
-        split='train', split_ratio=1.0 - (args.val_set_size/total_lines),
-        shuffle_buffer_size=args.shuffle_buffer_size
-    )
-    
-    val_dataset = FixedSizeSELFIESDataset(
-        args.data_path, tokenizer, config.max_seq_len,
-        num_samples=args.val_set_size, total_lines=total_lines
-    )
-    
-    # Create data loaders
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        pin_memory=device.type == 'cuda',
-        persistent_workers=args.num_workers > 0,
-        collate_fn=partial(collate_fn, pad_token_id=tokenizer.pad_token_id)
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        pin_memory=device.type == 'cuda',
-        collate_fn=partial(collate_fn, pad_token_id=tokenizer.pad_token_id)
-    )
-    
-    print(f"Training dataset ready")
-    print(f"Validation dataset size: {len(val_dataset)}")
-    
-    # Create model
-    print("Initializing model...")
-    model = SELFIESGPTDecoder(config).to(device)
-    
-    # Compile model if requested
-    if args.use_compile and hasattr(torch, 'compile'):
-        print("Compiling model...")
-        model = torch.compile(model)
-    
-    # Calculate model parameters
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
-    
-    # Setup optimizer
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.learning_rate,
-        weight_decay=config.weight_decay,
-        betas=(0.9, 0.95)
-    )
-    
-    # Setup gradient scaler for AMP
-    scaler = GradScaler(device.type) if args.use_amp else None
-    
-    # Setup checkpoint directory
-    checkpoint_dir = Path(args.checkpoint_dir)
-    checkpoint_dir.mkdir(exist_ok=True)
-    
-    # Resume from checkpoint if specified
-    start_step = 0
-    best_val_loss = float('inf')
-    
-    if args.resume_from:
-        print(f"Resuming from checkpoint: {args.resume_from}")
-        checkpoint = torch.load(args.resume_from, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        if scaler and 'scaler_state_dict' in checkpoint:
-            scaler.load_state_dict(checkpoint['scaler_state_dict'])
-        start_step = checkpoint['step']
-        best_val_loss = checkpoint.get('best_val_loss', float('inf'))
-        print(f"Resumed from step {start_step}")
-    
-    # Training loop
-    print(f"Starting training from step {start_step}...")
-    model.train()
-    
-    running_loss = 0.0
+    pbar = tqdm(loader, desc="Contrastive Training")
     optimizer.zero_grad()
     
-    # Progress bar
-    pbar = tqdm(range(start_step, args.max_steps), initial=start_step, total=args.max_steps)
-    
-    for step, batch in enumerate(train_loader, start=start_step):
-        if step >= args.max_steps:
-            break
-        
-        # Update learning rate
-        lr = get_learning_rate(step, config)
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
-        
+    for i, batch in enumerate(pbar):
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
+        labels = batch['labels'].to(device)
         
-        # Forward pass (no constraints during training to avoid over-masking)
-        t0 = time.time()
+        with autocast(device.type, enabled=args.use_amp):
+            loss_dict = model.combined_loss(
+                input_ids, attention_mask, labels,
+                alpha=args.alpha, beta=args.beta, gamma=args.gamma
+            )
+            loss = loss_dict['loss'] / args.grad_accumulation_steps
         
         if args.use_amp:
-            with autocast(device.type):
-                outputs = model(input_ids, attention_mask=attention_mask, apply_constraints=False)
-                # Shift for causal LM loss
-                shift_logits = outputs[:, :-1, :].contiguous()
-                shift_labels = input_ids[:, 1:].contiguous()
-                
-                loss = nn.functional.cross_entropy(
-                    shift_logits.view(-1, shift_logits.size(-1)),
-                    shift_labels.view(-1),
-                    ignore_index=tokenizer.pad_token_id
-                )
-                loss = loss / args.grad_accumulation_steps
-                
-                # Debug: Check for abnormal loss values
-                if loss.item() > 100:
-                    print(f"WARNING: Abnormally high loss: {loss.item():.2f}")
-                    print(f"Logits shape: {shift_logits.shape}, min/max: {shift_logits.min().item():.2f}/{shift_logits.max().item():.2f}")
-                    print(f"Labels shape: {shift_labels.shape}, unique values: {torch.unique(shift_labels).tolist()}")
-        else:
-            outputs = model(input_ids, attention_mask=attention_mask, apply_constraints=False)
-            shift_logits = outputs[:, :-1, :].contiguous()
-            shift_labels = input_ids[:, 1:].contiguous()
-            
-            loss = nn.functional.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                ignore_index=tokenizer.pad_token_id
-            )
-            loss = loss / args.grad_accumulation_steps
-            
-            # Debug: Check for abnormal loss values
-            if loss.item() > 100:
-                print(f"WARNING: Abnormally high loss: {loss.item():.2f}")
-                print(f"Logits shape: {shift_logits.shape}, min/max: {shift_logits.min().item():.2f}/{shift_logits.max().item():.2f}")
-                print(f"Labels shape: {shift_labels.shape}, unique values: {torch.unique(shift_labels).tolist()}")
-        
-        # Backward pass
-        if args.use_amp and scaler is not None:
             scaler.scale(loss).backward()
         else:
             loss.backward()
         
-        running_loss += loss.item()
-        
-        # Update weights
-        if (step + 1) % args.grad_accumulation_steps == 0:
-            if args.use_amp and scaler is not None:
+        if (i + 1) % args.grad_accumulation_steps == 0:
+            if args.use_amp:
                 scaler.unscale_(optimizer)
-                if args.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            if args.use_amp:
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                if args.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 optimizer.step()
-            
             optimizer.zero_grad()
+
+        totals['loss'] += loss.item() * args.grad_accumulation_steps
+        totals['cont'] += loss_dict['contrastive_loss'].item()
+        totals['recon'] += loss_dict['reconstruction_loss'].item()
+        totals['div'] += loss_dict['diversity_loss'].item()
         
-        dt = time.time() - t0
+        pbar.set_postfix({k: v / (i + 1) for k, v in totals.items()})
         
-        # Update progress bar
-        if step % 10 == 0:
-            mfu = estimate_mfu(model, config, dt, args.grad_accumulation_steps * args.batch_size)
-            pbar.set_description(
-                f"loss: {running_loss/(step-start_step+1):.4f}, "
-                f"lr: {lr:.2e}, "
-                f"mfu: {mfu*100:.2f}%"
-            )
-        pbar.update(1)
+    return {k: v / len(loader) for k, v in totals.items()}
+
+
+def _validate_contrastive(model, loader, device, args):
+    """Validate the contrastive model."""
+    model.eval()
+    total_loss = 0
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="Contrastive Validation"):
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
+            with autocast(device.type, enabled=args.use_amp):
+                loss = model.forward_contrastive(input_ids, attention_mask, labels)['loss']
+            total_loss += loss.item()
+    return total_loss / len(loader)
+
+# endregion
+
+# region: Generative Learning Functions
+# ==============================================================================
+
+def get_learning_rate(step: int, config: ModelConfig) -> float:
+    """Learning rate schedule with warmup and cosine annealing."""
+    if step < config.warmup_steps:
+        return config.learning_rate * step / config.warmup_steps
+    if step > config.max_steps:
+        return config.min_learning_rate
+    decay_ratio = (step - config.warmup_steps) / (config.max_steps - config.warmup_steps)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return config.min_learning_rate + coeff * (config.learning_rate - config.min_learning_rate)
+
+
+def validate_model(model: nn.Module, val_dataloader: DataLoader, device: torch.device, use_amp: bool = False) -> float:
+    """Run validation and return average loss for the generative model."""
+    model.eval()
+    total_loss = 0.0
+    with torch.no_grad():
+        for batch in val_dataloader:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            with autocast(device.type, enabled=use_amp):
+                outputs = model(input_ids, attention_mask=attention_mask)
+                shift_logits = outputs[:, :-1, :].contiguous()
+                shift_labels = input_ids[:, 1:].contiguous()
+                loss = nn.functional.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=0)
+            total_loss += loss.item()
+    model.train()
+    return total_loss / len(val_dataloader) if val_dataloader else float('inf')
+
+
+def generate_molecules(model: nn.Module, tokenizer: SELFIETokenizer, device: torch.device, args) -> List[str]:
+    """Generate molecules with advanced sampling."""
+    model.eval()
+    generated_molecules = []
+    with torch.no_grad():
+        for _ in range(args.num_generated):
+            current_sequence = [tokenizer.bos_token_id]
+            for _ in range(args.max_seq_len):
+                input_ids = torch.tensor([current_sequence], device=device)
+                outputs = model(input_ids, apply_constraints=args.use_grammar_constraints)
+                logits = outputs[0, -1, :]
+                
+                # Apply sampling techniques (temperature, top-k, top-p)
+                logits = logits / args.temperature
+                if args.top_k > 0:
+                    top_k_vals, _ = torch.topk(logits, args.top_k)
+                    logits[logits < top_k_vals[-1]] = -float('Inf')
+                
+                probs = torch.softmax(logits, dim=-1)
+                next_token_id = torch.multinomial(probs, 1).item()
+
+                if next_token_id == tokenizer.eos_token_id:
+                    break
+                current_sequence.append(next_token_id)
+
+            generated_molecules.append(tokenizer.decode(current_sequence, skip_special_tokens=True))
+    model.train()
+    return generated_molecules
+
+# endregion
+
+# region: Main Training Phases
+# ==============================================================================
+
+def run_contrastive_phase(args, tokenizer, device):
+    """Runs the contrastive pre-training phase."""
+    print("--- Starting Contrastive Pre-training Phase ---")
+    
+    # Config
+    if args.model_size == "small":
+        config = ModelConfig.small_config()
+    elif args.model_size == "standard":
+        config = ModelConfig.standard_config()
+    else: # large
+        config = ModelConfig.large_config()
+    config.vocab_size = tokenizer.vocab_size
+
+    # Datasets and loaders
+    augmenter = SELFIESAugmenter(tokenizer)
+    
+    # Use subset size if provided, otherwise use the full dataset
+    total_lines = args.dataset_subset_size or count_lines(args.data_path)
+    val_size = min(args.val_set_size, int(total_lines * 0.1)) # Use 10% for val if val_set_size is too large
+    train_split_ratio = 1.0 - (val_size / total_lines) if total_lines > 0 else 0.0
+
+    print(f"Dataset size: {total_lines}, Train/Val split: {train_split_ratio:.2f}/{1-train_split_ratio:.2f}")
+
+    train_dataset = SELFIESDataset(
+        args.data_path, tokenizer, config.max_seq_len,
+        total_lines=total_lines, split='train', split_ratio=train_split_ratio
+    )
+    val_dataset = SELFIESDataset(
+        args.data_path, tokenizer, config.max_seq_len,
+        total_lines=total_lines, split='val', split_ratio=train_split_ratio
+    )
+    
+    collate_partial = partial(_contrastive_collate_fn, tokenizer=tokenizer, augmenter=augmenter, num_augmentations=args.num_augmentations)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_partial)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_partial)
+    
+    # Model, optimizer, scaler
+    model = ContrastiveSELFIESModel(config).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    scaler = GradScaler(enabled=args.use_amp)
+    
+    # Training loop
+    best_val_loss = float('inf')
+    output_dir = Path(args.output_dir) / "contrastive"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for epoch in range(args.num_epochs):
+        print(f"\nEpoch {epoch + 1}/{args.num_epochs}")
+        train_metrics = _train_contrastive_epoch(model, train_loader, optimizer, scaler, device, args)
+        val_loss = _validate_contrastive(model, val_loader, device, args)
+        print(f"Validation Loss: {val_loss:.4f}")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            # Save the base model's state_dict for generative fine-tuning
+            torch.save(model.model.state_dict(), output_dir / "best_pretrained_model.pt")
+            print(f"Saved best pre-trained model with validation loss: {val_loss:.4f}")
+
+    print("--- Contrastive Pre-training Phase Complete ---")
+    return output_dir / "best_pretrained_model.pt"
+
+
+def run_generative_phase(args, tokenizer, device):
+    """Runs the generative fine-tuning phase."""
+    print("--- Starting Generative Fine-tuning Phase ---")
+
+    # Config
+    if args.model_size == "small":
+        config = ModelConfig.small_config()
+    elif args.model_size == "standard":
+        config = ModelConfig.standard_config()
+    else: # large
+        config = ModelConfig.large_config()
+    config.vocab_size = tokenizer.vocab_size
+    config.max_steps = args.max_steps
+
+    # Datasets and loaders
+    total_lines = args.dataset_subset_size or count_lines(args.data_path)
+    val_size = min(args.val_set_size, int(total_lines * 0.1))
+    train_split_ratio = 1.0 - (val_size / total_lines) if total_lines > 0 else 0.0
+    
+    print(f"Dataset size: {total_lines}, Train/Val split: {train_split_ratio:.2f}/{1-train_split_ratio:.2f}")
+
+    train_dataset = SELFIESDataset(
+        args.data_path, tokenizer, config.max_seq_len,
+        total_lines=total_lines, split='train', split_ratio=train_split_ratio
+    )
+    val_dataset = SELFIESDataset(
+        args.data_path, tokenizer, config.max_seq_len,
+        total_lines=total_lines, split='val', split_ratio=train_split_ratio
+    )
+    
+    collate_partial = partial(collate_fn, pad_token_id=tokenizer.pad_token_id)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_partial)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_partial)
+
+    # Model, optimizer, scaler
+    model = SELFIESGPTDecoder(config).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    scaler = GradScaler(enabled=args.use_amp)
+    
+    start_step = 0
+    if args.load_pretrained:
+        print(f"Loading pre-trained model from: {args.load_pretrained}")
+        model.load_state_dict(torch.load(args.load_pretrained, map_location=device))
+
+    # Training loop
+    output_dir = Path(args.output_dir) / "generative"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    pbar = tqdm(range(start_step, args.max_steps), initial=start_step, total=args.max_steps)
+    
+    best_val_loss = float('inf')
+    train_iter = iter(train_loader)
+
+    for step in pbar:
+        try:
+            batch = next(train_iter)
+        except StopIteration:
+            train_iter = iter(train_loader)
+            batch = next(train_iter)
+
+        lr = get_learning_rate(step, config)
+        for param_group in optimizer.param_groups: param_group['lr'] = lr
         
-        # Validation
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        
+        with autocast(device.type, enabled=args.use_amp):
+            outputs = model(input_ids, attention_mask=attention_mask)
+            shift_logits = outputs[:, :-1, :].contiguous()
+            shift_labels = input_ids[:, 1:].contiguous()
+            loss = nn.functional.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=tokenizer.pad_token_id)
+        
+        if args.use_amp:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+        else:
+            loss.backward()
+        
+        if config.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+        
+        if args.use_amp:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
+        
+        optimizer.zero_grad(set_to_none=True)
+
         if (step + 1) % args.eval_interval == 0:
-            print(f"\nRunning validation at step {step + 1}...")
             val_loss = validate_model(model, val_loader, device, args.use_amp)
-            train_loss = running_loss / (step - start_step + 1)
-            
-            print(f"Step {step + 1}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}")
-            
-            # Save best model
+            print(f"\nStep {step + 1}: Validation Loss: {val_loss:.4f}")
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                best_checkpoint = {
-                    'step': step + 1,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'config': config.__dict__,
-                    'train_loss': train_loss,
-                    'val_loss': val_loss,
-                    'best_val_loss': best_val_loss,
-                    'vocab_size': tokenizer.vocab_size
-                }
-                if scaler:
-                    best_checkpoint['scaler_state_dict'] = scaler.state_dict()
-                
-                torch.save(best_checkpoint, checkpoint_dir / "best_model.pt")
-                print(f"Saved best model with validation loss: {val_loss:.4f}")
+                torch.save(model.state_dict(), output_dir / "best_generative_model.pt")
+                print(f"Saved new best model.")
         
-        # Generate molecules
         if (step + 1) % args.generate_interval == 0:
-            print(f"\nGenerating molecules at step {step + 1}...")
-            molecules = generate_molecules(
-                model, tokenizer, device,
-                num_molecules=args.num_generated,
-                max_length=config.max_seq_len,
-                temperature=args.temperature,
-                top_k=args.top_k,
-                top_p=args.top_p,
-                repetition_penalty=args.repetition_penalty,
-                use_grammar_constraints=args.use_grammar_constraints
-            )
-            
-            print("Generated molecules:")
-            for i, mol in enumerate(molecules, 1):
-                print(f"  {i}: {mol}")
-        
-        # Save checkpoint
-        if (step + 1) % args.save_interval == 0:
-            checkpoint = {
-                'step': step + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'config': config.__dict__,
-                'train_loss': running_loss / (step - start_step + 1),
-                'best_val_loss': best_val_loss,
-                'vocab_size': tokenizer.vocab_size
-            }
-            if scaler:
-                checkpoint['scaler_state_dict'] = scaler.state_dict()
-            
-            torch.save(checkpoint, checkpoint_dir / f"checkpoint_step_{step + 1}.pt")
-            print(f"\nSaved checkpoint at step {step + 1}")
-    
-    # Final save
-    final_checkpoint = {
-        'step': args.max_steps,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'config': config.__dict__,
-        'train_loss': running_loss / (args.max_steps - start_step),
-        'best_val_loss': best_val_loss,
-        'vocab_size': tokenizer.vocab_size
-    }
-    if scaler:
-        final_checkpoint['scaler_state_dict'] = scaler.state_dict()
-    
-    torch.save(final_checkpoint, checkpoint_dir / "final_model.pt")
-    print(f"\nTraining completed! Final model saved.")
-    
-    print("\nRunning final validation...")
-    final_val_loss = validate_model(model, val_loader, device, args.use_amp)
-    print(f"Final validation loss: {final_val_loss:.4f}")
-    print(f"Best validation loss during training: {best_val_loss:.4f}")
+            print("\nGenerating molecules...")
+            molecules = generate_molecules(model, tokenizer, device, args)
+            for i, mol in enumerate(molecules): print(f"  {i+1}: {mol}")
 
-    pbar.close()
+    print("--- Generative Fine-tuning Phase Complete ---")
+
+
+def main():
+    """Main entry point for training."""
+    parser = argparse.ArgumentParser(description="Unified SELFIES Model Training")
+
+    # Core arguments
+    parser.add_argument("--training_mode", type=str, default="end-to-end",
+                        choices=["contrastive", "generative", "end-to-end"],
+                        help="The training mode to use.")
+    parser.add_argument("--data_path", type=str, required=True, help="Path to training CSV file")
+    parser.add_argument("--output_dir", type=str, default="checkpoints", help="Directory to save checkpoints and results")
+    parser.add_argument("--model_size", type=str, default="small",
+                        choices=["small", "standard", "large"],
+                        help="Size of the model to train.")
+    parser.add_argument("--pretrained_model_path", type=str, default=None,
+                        help="Path to a pretrained model for generative fine-tuning.")
+    
+    # Data arguments
+    data_group = parser.add_argument_group('Data settings')
+    data_group.add_argument("--vocab_path", type=str, default="checkpoints/vocab_cache.json", help="Path to vocabulary file (will be created if it doesn't exist)")
+    data_group.add_argument("--val_set_size", type=int, default=10000, help="Size of the validation set")
+    data_group.add_argument("--max_seq_len", type=int, default=256, help="Maximum sequence length")
+
+    # Training arguments
+    train_group = parser.add_argument_group('General training settings')
+    train_group.add_argument("--batch_size", type=int, default=32, help="Batch size")
+    train_group.add_argument("--learning_rate", type=float, default=3e-4, help="Peak learning rate")
+    train_group.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay")
+    train_group.add_argument("--grad_accumulation_steps", type=int, default=1, help="Gradient accumulation steps")
+
+    # Contrastive phase arguments
+    contrastive_group = parser.add_argument_group('Contrastive pre-training settings')
+    contrastive_group.add_argument("--num_epochs", type=int, default=50, help="Number of epochs for contrastive pre-training")
+    contrastive_group.add_argument("--num_augmentations", type=int, default=2, help="Number of augmentations per sample for contrastive learning.")
+    contrastive_group.add_argument("--alpha", type=float, default=0.5, help="Weight for contrastive loss.")
+    contrastive_group.add_argument("--beta", type=float, default=0.1, help="Weight for reconstruction loss in contrastive phase")
+    contrastive_group.add_argument("--gamma", type=float, default=0.01, help="Weight for diversity loss in contrastive phase")
+
+    # Generative phase arguments
+    generative_group = parser.add_argument_group('Generative fine-tuning settings')
+    generative_group.add_argument("--max_steps", type=int, default=50000, help="Maximum training steps for generative phase")
+    generative_group.add_argument("--warmup_steps", type=int, default=2000, help="Warmup steps for learning rate schedule")
+    generative_group.add_argument("--eval_interval", type=int, default=500, help="Interval for validation")
+    generative_group.add_argument("--generate_interval", type=int, default=2000, help="Interval for generating sample molecules")
+    generative_group.add_argument("--num_generated", type=int, default=5, help="Number of molecules to generate")
+    generative_group.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature")
+    generative_group.add_argument("--top_k", type=int, default=50, help="Top-k sampling")
+    generative_group.add_argument("--use_grammar_constraints", action="store_true", help="Use grammar constraints during generation.")
+    
+    # System arguments
+    system_group = parser.add_argument_group('System settings')
+    system_group.add_argument("--device", type=str, default="auto", help="Device to use (cuda/cpu/auto)")
+    system_group.add_argument("--use_amp", action="store_true", help="Use automatic mixed precision")
+    system_group.add_argument("--num_workers", type=int, default=4, help="Number of dataloader workers")
+    system_group.add_argument("--load_pretrained", type=str, default=None, help="Path to load a pre-trained model for the generative phase")
+
+    # New arguments
+    parser.add_argument("--dataset_subset_size", type=int, default=None, help="Use a subset of the dataset for quick testing.")
+
+
+    args = parser.parse_args()
+    
+    # Setup
+    device = torch.device("cuda" if torch.cuda.is_available() and args.device == "auto" else "cpu")
+    print(f"Using device: {device}")
+    
+    # Create tokenizer from specified vocab path
+    vocab_path = Path(args.vocab_path)
+    if not vocab_path.parent.exists():
+        print(f"Creating directory for vocabulary: {vocab_path.parent}")
+        vocab_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not vocab_path.exists():
+        print(f"Vocabulary not found at {vocab_path}. Building from data...")
+        tokenizer = SELFIETokenizer(training_data_path=args.data_path)
+        tokenizer._save_vocab(tokenizer.vocab, str(vocab_path))
+        print(f"Vocabulary built and saved to {vocab_path}")
+    else:
+        print(f"Loading vocabulary from {vocab_path}")
+        tokenizer = SELFIETokenizer(vocab_file=str(vocab_path))
+    
+    print(f"Vocabulary size: {tokenizer.vocab_size}")
+
+    # Run training
+    pretrained_model_path = None
+    if args.training_mode in ["contrastive", "end-to-end"]:
+        pretrained_model_path = run_contrastive_phase(args, tokenizer, device)
+
+        if pretrained_model_path and pretrained_model_path.exists():
+            print("\n--- Generating molecules after contrastive phase ---")
+            if args.model_size == "small": config = ModelConfig.small_config()
+            elif args.model_size == "standard": config = ModelConfig.standard_config()
+            else: config = ModelConfig.large_config()
+            config.vocab_size = tokenizer.vocab_size
+
+            generative_model = SELFIESGPTDecoder(config).to(device)
+            print(f"Loading pretrained weights from {pretrained_model_path}")
+            generative_model.load_state_dict(torch.load(pretrained_model_path, map_location=device))
+
+            molecules = generate_molecules(generative_model, tokenizer, device, args)
+            print("Generated molecules post-contrastive:")
+            for i, mol in enumerate(molecules):
+                print(f"  {i+1}: {mol}")
+            print("--------------------------------------------------")
+
+        # For end-to-end, use the newly trained model
+        if args.training_mode == "end-to-end":
+            args.load_pretrained = pretrained_model_path
+    
+    if args.training_mode in ["generative", "end-to-end"]:
+        if args.training_mode == "generative" and not args.load_pretrained:
+            print("Warning: Running generative training from scratch without a pre-trained model.")
+        run_generative_phase(args, tokenizer, device)
+
+    print("\n--- Training Pipeline Complete ---")
 
 
 if __name__ == "__main__":
-    main() 
+    main()
+
+# endregion 
