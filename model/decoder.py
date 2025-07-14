@@ -275,42 +275,117 @@ class TrainingStabilizer:
             'intervention_count': self.intervention_count
         }
 
+class LabelSmoothingCrossEntropy(nn.Module):
+    """
+    Label smoothing cross-entropy to prevent overconfident predictions.
+    
+    Replaces one-hot targets with smoothed labels to encourage better calibration
+    and prevent the model from outputting extreme logits.
+    """
+    
+    def __init__(self, epsilon=0.1, reduction='mean', ignore_index=-100):
+        super().__init__()
+        self.epsilon = epsilon
+        self.reduction = reduction
+        self.ignore_index = ignore_index
+    
+    def forward(self, preds, target):
+        """
+        Args:
+            preds: Model predictions [N, C] where C is number of classes
+            target: Target labels [N]
+        """
+        n = preds.size(-1)
+        log_preds = F.log_softmax(preds, dim=-1)
+        
+        # Create mask for valid (non-ignored) tokens
+        if self.ignore_index >= 0:
+            valid_mask = (target != self.ignore_index)
+            target_masked = target.masked_fill(~valid_mask, 0)  # Replace ignored with 0 for indexing
+        else:
+            valid_mask = torch.ones_like(target, dtype=torch.bool)
+            target_masked = target
+        
+        # Compute standard NLL loss
+        nll = F.nll_loss(log_preds, target_masked, reduction='none')
+        
+        # Compute uniform loss (entropy regularization)
+        uniform_loss = -log_preds.sum(dim=-1)
+        
+        # Apply mask to exclude ignored tokens
+        if self.ignore_index >= 0:
+            nll = nll.masked_fill(~valid_mask, 0.0)
+            uniform_loss = uniform_loss.masked_fill(~valid_mask, 0.0)
+        
+        # Combine losses with label smoothing
+        loss = (1 - self.epsilon) * nll + self.epsilon * uniform_loss / n
+        
+        # Apply reduction
+        if self.reduction == 'mean':
+            if self.ignore_index >= 0:
+                return loss.sum() / valid_mask.sum().clamp(min=1)
+            else:
+                return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+
 class ReconstructionLoss(nn.Module):
     """
-    Clean reconstruction loss without overly aggressive anti-collapse mechanisms.
+    Reconstruction loss with label smoothing to prevent overconfident predictions.
     
-    Focuses on proper loss computation rather than trying to prevent normal convergence.
+    Uses label smoothing to encourage better calibration and prevent extreme logits
+    that make the model brittle and repetitive.
     """
     
-    def __init__(self, pad_token_id: int, min_sequence_length: int = 5):
+    def __init__(self, pad_token_id: int, min_sequence_length: int = 5, label_smoothing: float = 0.1):
         super().__init__()
         self.pad_token_id = pad_token_id
         self.min_sequence_length = min_sequence_length
+        self.label_smoothing = label_smoothing
+        
+        # Use label smoothing cross-entropy instead of standard cross-entropy
+        self.loss_fn = LabelSmoothingCrossEntropy(
+            epsilon=label_smoothing,
+            ignore_index=pad_token_id
+        )
     
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
-        Compute reconstruction loss with minimal intervention.
+        Compute reconstruction loss with label smoothing.
         
         Args:
             logits: Model predictions [batch, seq_len, vocab_size]
             targets: Target token IDs [batch, seq_len]
         """
-        # Standard cross-entropy loss
-        reconstruction_loss = F.cross_entropy(
+        # Label smoothing cross-entropy loss
+        reconstruction_loss = self.loss_fn(
             logits.reshape(-1, logits.size(-1)),
-            targets.reshape(-1),
-            ignore_index=self.pad_token_id,
-            reduction='mean'
+            targets.reshape(-1)
         )
         
-        # Mild length encouragement (not aggressive penalty)
+        # Optional: Add entropy regularization for additional diversity
+        probs = F.softmax(logits, dim=-1)
+        entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=-1)
+        
+        # Mask out padding tokens for entropy
+        valid_mask = (targets != self.pad_token_id)
+        if valid_mask.any():
+            entropy_reg = entropy[valid_mask].mean() * 0.01  # Small entropy bonus
+        else:
+            entropy_reg = torch.tensor(0.0, device=logits.device)
+        
+        # Mild length encouragement
         sequence_lengths = (targets != self.pad_token_id).sum(dim=1).float()
         length_bonus = torch.clamp(sequence_lengths - self.min_sequence_length, min=0.0).mean() * 0.01
         
         return {
-            'reconstruction_loss': reconstruction_loss,
+            'reconstruction_loss': reconstruction_loss - entropy_reg,  # Subtract because we want higher entropy
+            'entropy_regularization': entropy_reg,
             'length_bonus': length_bonus,
-            'average_sequence_length': sequence_lengths.mean()
+            'average_sequence_length': sequence_lengths.mean(),
+            'average_entropy': entropy[valid_mask].mean() if valid_mask.any() else torch.tensor(0.0, device=logits.device)
         }
 
 class DiversityRegularizer(nn.Module):
@@ -845,13 +920,18 @@ class SELFIESGPTDecoder(nn.Module):
         else:
             contrastive_loss = torch.tensor(0.0, device=logits.device)
 
-        # 2. Reconstruction Loss (auxiliary)
+        # 2. Reconstruction Loss (auxiliary) with label smoothing
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = input_ids[:, 1:].contiguous()
-        reconstruction_loss = F.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1),
+        
+        # Use label smoothing to prevent overconfident predictions
+        label_smoothing_fn = LabelSmoothingCrossEntropy(
+            epsilon=0.1,
             ignore_index=getattr(self, 'pad_token_id', 0)
+        )
+        reconstruction_loss = label_smoothing_fn(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1)
         )
         
         # Total loss
