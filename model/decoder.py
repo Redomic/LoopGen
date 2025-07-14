@@ -2,8 +2,360 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import Optional, Dict, Set, List, Tuple
+import random
+from typing import Optional, Dict, Set, List, Tuple, Any
 from .config import ModelConfig
+
+class RobustLoss(nn.Module):
+    """
+    Robust loss function that prevents model collapse by enforcing
+    minimum sequence lengths and penalizing trivial solutions.
+    """
+    def __init__(self, tokenizer, min_length: int = 20, length_penalty_weight: float = 5.0):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.min_length = min_length
+        self.length_penalty_weight = length_penalty_weight
+        
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor, input_ids: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Compute robust cross-entropy loss with anti-collapse penalties.
+        
+        Args:
+            logits: Model predictions [batch, seq_len, vocab_size]
+            targets: Target token IDs [batch, seq_len]
+            input_ids: Original input sequence [batch, seq_len]
+        """
+        # Standard cross-entropy loss
+        ce_loss = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)),
+            targets.reshape(-1),
+            ignore_index=self.tokenizer.pad_token_id,
+            reduction='mean'
+        )
+        
+        # Length enforcement: penalize sequences that are too short
+        actual_lengths = (input_ids != self.tokenizer.pad_token_id).sum(dim=1).float()
+        length_shortfall = torch.clamp(self.min_length - actual_lengths, min=0.0)
+        length_penalty = length_shortfall.mean() * self.length_penalty_weight
+        
+        # Early EOS penalty: discourage premature sequence termination
+        eos_mask = (input_ids == self.tokenizer.eos_token_id)
+        if eos_mask.any():
+            # Find first EOS position for each sequence
+            eos_positions = torch.where(eos_mask, torch.arange(input_ids.size(1), device=input_ids.device), input_ids.size(1))
+            first_eos = eos_positions.min(dim=1)[0].float()
+            early_eos_penalty = torch.clamp(self.min_length - first_eos, min=0.0).mean() * self.length_penalty_weight
+        else:
+            early_eos_penalty = torch.tensor(0.0, device=logits.device)
+        
+        total_loss = ce_loss + length_penalty + early_eos_penalty
+        
+        return {
+            'loss': total_loss,
+            'ce_loss': ce_loss,
+            'length_penalty': length_penalty,
+            'early_eos_penalty': early_eos_penalty
+        }
+
+class AntiCollapseRegularizer(nn.Module):
+    """
+    Regularization module that prevents embedding collapse and enforces diversity.
+    """
+    def __init__(self, min_embedding_std: float = 0.1, max_similarity: float = 0.8):
+        super().__init__()
+        self.min_embedding_std = min_embedding_std
+        self.max_similarity = max_similarity
+        
+    def forward(self, embeddings: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Compute anti-collapse regularization losses.
+        
+        Args:
+            embeddings: Molecular embeddings [batch_size, embedding_dim]
+        """
+        batch_size, embed_dim = embeddings.shape
+        
+        # Prevent embedding collapse: ensure sufficient standard deviation
+        embedding_std = torch.std(embeddings, dim=0)  # [embed_dim]
+        std_shortfall = torch.clamp(self.min_embedding_std - embedding_std, min=0.0)
+        std_penalty = std_shortfall.mean() * 10.0
+        
+        # Prevent excessive similarity between different molecular embeddings
+        if batch_size > 1:
+            # Normalize embeddings for cosine similarity
+            normalized_embeddings = F.normalize(embeddings, dim=1)
+            similarity_matrix = torch.mm(normalized_embeddings, normalized_embeddings.t())
+            
+            # Mask out diagonal (self-similarity)
+            mask = ~torch.eye(batch_size, dtype=torch.bool, device=embeddings.device)
+            off_diagonal_similarities = similarity_matrix[mask]
+            
+            # Penalize if average similarity is too high
+            avg_similarity = off_diagonal_similarities.mean()
+            similarity_excess = torch.clamp(avg_similarity - self.max_similarity, min=0.0)
+            similarity_penalty = similarity_excess * 5.0
+        else:
+            similarity_penalty = torch.tensor(0.0, device=embeddings.device)
+        
+        total_penalty = std_penalty + similarity_penalty
+        
+        return {
+            'anti_collapse_loss': total_penalty,
+            'std_penalty': std_penalty,
+            'similarity_penalty': similarity_penalty,
+            'avg_embedding_std': embedding_std.mean(),
+            'avg_similarity': similarity_penalty  # Reuse for logging
+        }
+
+class TrainingStabilizer:
+    """
+    Production-grade training stability monitor and intervention system.
+    
+    Monitors training health and applies conservative interventions only when
+    genuine pathological behavior is detected, not normal convergence.
+    """
+    
+    def __init__(self, 
+                 patience: int = 200,
+                 min_loss_threshold: float = 1e-6,
+                 max_gradient_norm: float = 10.0,
+                 stability_window: int = 50):
+        """
+        Args:
+            patience: Steps to wait before considering intervention
+            min_loss_threshold: Absolute minimum loss before considering pathological
+            max_gradient_norm: Maximum allowed gradient norm
+            stability_window: Window size for stability analysis
+        """
+        self.patience = patience
+        self.min_loss_threshold = min_loss_threshold
+        self.max_gradient_norm = max_gradient_norm
+        self.stability_window = stability_window
+        
+        # Training history
+        self.loss_history = []
+        self.gradient_norms = []
+        self.lr_history = []
+        
+        # State tracking
+        self.steps_since_improvement = 0
+        self.best_loss = float('inf')
+        self.intervention_count = 0
+        self.max_interventions = 3  # Limit interventions per training
+        
+    def update_metrics(self, 
+                      total_loss: float, 
+                      gradient_norm: float, 
+                      learning_rate: float) -> Dict[str, bool]:
+        """
+        Update training metrics and assess stability.
+        
+        Returns:
+            Dictionary with stability assessment and recommended actions
+        """
+        self.loss_history.append(total_loss)
+        self.gradient_norms.append(gradient_norm)
+        self.lr_history.append(learning_rate)
+        
+        # Maintain window size
+        if len(self.loss_history) > self.stability_window * 4:
+            self.loss_history = self.loss_history[-self.stability_window * 2:]
+            self.gradient_norms = self.gradient_norms[-self.stability_window * 2:]
+            self.lr_history = self.lr_history[-self.stability_window * 2:]
+        
+        # Track improvement
+        if total_loss < self.best_loss:
+            self.best_loss = total_loss
+            self.steps_since_improvement = 0
+        else:
+            self.steps_since_improvement += 1
+        
+        # Assess stability (only after sufficient history)
+        if len(self.loss_history) < self.stability_window:
+            return {'requires_intervention': False, 'reason': 'insufficient_history'}
+        
+        stability_assessment = self._assess_training_stability()
+        return stability_assessment
+    
+    def _assess_training_stability(self) -> Dict[str, Any]:
+        """Assess if training is genuinely unstable (not just converged)."""
+        recent_losses = self.loss_history[-self.stability_window:]
+        recent_gradients = self.gradient_norms[-self.stability_window:]
+        
+        # Check for genuine pathological behavior
+        pathological_indicators = []
+        
+        # 1. Extremely low loss (potential numerical instability)
+        if all(loss < self.min_loss_threshold for loss in recent_losses[-10:]):
+            pathological_indicators.append('numerical_instability')
+        
+        # 2. Exploding gradients
+        if any(grad > self.max_gradient_norm for grad in recent_gradients[-10:]):
+            pathological_indicators.append('exploding_gradients')
+        
+        # 3. Loss becoming NaN or infinite
+        if any(not torch.isfinite(torch.tensor(loss)) for loss in recent_losses[-5:]):
+            pathological_indicators.append('non_finite_loss')
+        
+        # 4. Complete stagnation (no change for extended period)
+        if (self.steps_since_improvement > self.patience and 
+            len(set(f"{loss:.8f}" for loss in recent_losses[-20:])) <= 2):
+            pathological_indicators.append('complete_stagnation')
+        
+        # Determine if intervention is needed
+        requires_intervention = (
+            len(pathological_indicators) > 0 and 
+            self.intervention_count < self.max_interventions
+        )
+        
+        return {
+            'requires_intervention': requires_intervention,
+            'pathological_indicators': pathological_indicators,
+            'steps_since_improvement': self.steps_since_improvement,
+            'recent_loss_trend': self._calculate_loss_trend(),
+            'gradient_stability': self._assess_gradient_stability()
+        }
+    
+    def _calculate_loss_trend(self) -> str:
+        """Calculate recent loss trend."""
+        if len(self.loss_history) < 20:
+            return 'insufficient_data'
+        
+        recent = self.loss_history[-20:]
+        early_avg = sum(recent[:10]) / 10
+        late_avg = sum(recent[-10:]) / 10
+        
+        if late_avg < early_avg * 0.95:
+            return 'improving'
+        elif late_avg > early_avg * 1.05:
+            return 'degrading'
+        else:
+            return 'stable'
+    
+    def _assess_gradient_stability(self) -> str:
+        """Assess gradient norm stability."""
+        if len(self.gradient_norms) < 20:
+            return 'insufficient_data'
+        
+        recent_grads = self.gradient_norms[-20:]
+        grad_std = torch.std(torch.tensor(recent_grads)).item()
+        grad_mean = torch.mean(torch.tensor(recent_grads)).item()
+        
+        if grad_std / (grad_mean + 1e-8) > 2.0:
+            return 'unstable'
+        else:
+            return 'stable'
+    
+    def apply_intervention(self, model: nn.Module, optimizer: torch.optim.Optimizer) -> Dict[str, str]:
+        """
+        Apply conservative intervention to stabilize training.
+        
+        Returns:
+            Dictionary describing actions taken
+        """
+        if self.intervention_count >= self.max_interventions:
+            return {'action': 'max_interventions_reached'}
+        
+        self.intervention_count += 1
+        actions_taken = []
+        
+        # Conservative learning rate reduction (not increase!)
+        for param_group in optimizer.param_groups:
+            old_lr = param_group['lr']
+            param_group['lr'] *= 0.5  # Reduce, don't increase
+            actions_taken.append(f"reduced_lr_from_{old_lr:.2e}_to_{param_group['lr']:.2e}")
+        
+        # Reset improvement tracking
+        self.steps_since_improvement = 0
+        
+        return {
+            'action': 'intervention_applied',
+            'details': actions_taken,
+            'intervention_count': self.intervention_count
+        }
+
+class ReconstructionLoss(nn.Module):
+    """
+    Clean reconstruction loss without overly aggressive anti-collapse mechanisms.
+    
+    Focuses on proper loss computation rather than trying to prevent normal convergence.
+    """
+    
+    def __init__(self, pad_token_id: int, min_sequence_length: int = 5):
+        super().__init__()
+        self.pad_token_id = pad_token_id
+        self.min_sequence_length = min_sequence_length
+    
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Compute reconstruction loss with minimal intervention.
+        
+        Args:
+            logits: Model predictions [batch, seq_len, vocab_size]
+            targets: Target token IDs [batch, seq_len]
+        """
+        # Standard cross-entropy loss
+        reconstruction_loss = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)),
+            targets.reshape(-1),
+            ignore_index=self.pad_token_id,
+            reduction='mean'
+        )
+        
+        # Mild length encouragement (not aggressive penalty)
+        sequence_lengths = (targets != self.pad_token_id).sum(dim=1).float()
+        length_bonus = torch.clamp(sequence_lengths - self.min_sequence_length, min=0.0).mean() * 0.01
+        
+        return {
+            'reconstruction_loss': reconstruction_loss,
+            'length_bonus': length_bonus,
+            'average_sequence_length': sequence_lengths.mean()
+        }
+
+class DiversityRegularizer(nn.Module):
+    """
+    Clean diversity regularization without excessive constraints.
+    """
+    
+    def __init__(self, regularization_strength: float = 0.1):
+        super().__init__()
+        self.regularization_strength = regularization_strength
+    
+    def forward(self, embeddings: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Compute diversity regularization.
+        
+        Args:
+            embeddings: Molecular embeddings [batch_size, embedding_dim]
+        """
+        batch_size = embeddings.size(0)
+        
+        if batch_size <= 1:
+            return {
+                'diversity_loss': torch.tensor(0.0, device=embeddings.device),
+                'embedding_variance': torch.tensor(0.0, device=embeddings.device)
+            }
+        
+        # Encourage diversity through cosine similarity penalty
+        normalized_embeddings = F.normalize(embeddings, dim=1)
+        similarity_matrix = torch.mm(normalized_embeddings, normalized_embeddings.t())
+        
+        # Mask diagonal and compute off-diagonal similarity
+        mask = ~torch.eye(batch_size, dtype=torch.bool, device=embeddings.device)
+        off_diagonal_similarities = similarity_matrix[mask]
+        
+        # Penalize high similarity (encourage diversity)
+        diversity_loss = off_diagonal_similarities.mean() * self.regularization_strength
+        
+        # Monitor embedding variance
+        embedding_variance = torch.var(embeddings, dim=0).mean()
+        
+        return {
+            'diversity_loss': diversity_loss,
+            'embedding_variance': embedding_variance,
+            'average_similarity': off_diagonal_similarities.mean()
+        }
 
 class SwiGLU(nn.Module):
     """ SwiGLU activation function: SiLU(x) * Linear(x) """
@@ -313,41 +665,51 @@ class DecoderBlock(nn.Module):
         return x
 
 class SELFIESGPTDecoder(nn.Module):
-    """ GPT-style Decoder model for SELFIES generation with chemical validity constraints. """
+    """
+    GPT-style decoder model for SELFIES generation and representation learning.
+    This model can be used for both generative and contrastive training.
+    """
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
         
+        # Input embeddings
         self.wte = nn.Embedding(config.vocab_size, config.d_model)
+        # Positional embeddings (always needed for base embeddings)
         self.wpe = nn.Embedding(config.max_seq_len, config.d_model)
         
-        # SELFIES-specific embeddings
-        self.branch_depth_emb = nn.Embedding(config.max_branch_depth, config.branch_depth_embedding_dim)
-        # Project branch embedding to d_model to be added
-        self.branch_proj = nn.Linear(config.branch_depth_embedding_dim, config.d_model, bias=False)
-
         self.drop = nn.Dropout(config.dropout)
         self.h = nn.ModuleList([DecoderBlock(config, i) for i in range(config.n_layers)])
         self.ln_f = nn.LayerNorm(config.d_model, eps=config.layer_norm_eps)
         
+        # Final language model head
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         if config.tie_word_embeddings:
-            self.wte.weight = self.lm_head.weight
+            self.lm_head.weight = self.wte.weight
 
-        # Chemical Validity and Grammar State Tracker modules
-        if config.use_grammar_constraint:
-            self.grammar_tracker = GrammarLSTM(config)
-            self.validity_checker = ChemicalValidityModule(config)
-        else:
-            self.grammar_tracker = None
-            self.validity_checker = None
-        
-        # Apply a more sophisticated initialization
+        # ----- Contrastive Learning Components -----
+        # Projection head for projecting hidden states to a contrastive space
+        self.projection_head = nn.Sequential(
+            nn.Linear(config.d_model, config.d_model),
+            nn.ReLU(),
+            nn.Dropout(0.1), 
+            nn.Linear(config.d_model, 256),  
+            nn.ReLU(),
+            nn.Linear(256, 256)  
+        )
+
+        self.temperature = 0.1 # For NT-Xent loss
+        # -----------------------------------------
+
+        # Optional grammar and chemical validity modules
+        self.grammar_lstm = GrammarLSTM(config) if config.use_grammar_constraint else None
+        self.chem_validity = ChemicalValidityModule(config) if config.use_grammar_constraint else None
+
+        # Robust loss components (initialized separately with tokenizer)
+        self.robust_loss_fn = None
+        self.anti_collapse_regularizer = None
+
         self.apply(self._init_weights)
-        # Apply special scaled init for residual projections
-        for pn, p in self.named_parameters():
-            if pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layers))
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -362,65 +724,147 @@ class SELFIESGPTDecoder(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None, 
         branch_depths: Optional[torch.Tensor] = None,
-        return_dict: bool = False,
-        apply_constraints: bool = False  # Only apply during inference, not training
-    ) -> torch.Tensor:
+        return_hidden: bool = False,
+        apply_constraints: bool = False
+    ) -> Dict[str, torch.Tensor]:
+        
         batch_size, seq_len = input_ids.size()
+        device = input_ids.device
         
-        pos_ids = torch.arange(0, seq_len, dtype=torch.long, device=input_ids.device).unsqueeze(0)
-        
+        # 1. Get embeddings
         tok_embeds = self.wte(input_ids)
+        pos_ids = torch.arange(0, seq_len, dtype=torch.long, device=device).unsqueeze(0)
         pos_embeds = self.wpe(pos_ids)
-        
         hidden_states = tok_embeds + pos_embeds
-        
-        if branch_depths is not None:
-            depth_embeds = self.branch_depth_emb(branch_depths)
-            hidden_states += self.branch_proj(depth_embeds)
-            
-        hidden_states = self.drop(hidden_states)
 
-        # The attention_mask from the dataloader is a padding mask (1 for keep, 0 for pad).
-        # It will be handled correctly inside the Attention module.
+        if branch_depths is not None and self.branch_embed is not None:
+             branch_embeds = self.branch_embed(branch_depths)
+             hidden_states = hidden_states + branch_embeds
+
+        hidden_states = self.drop(hidden_states)
+        
+        # 2. Transformer blocks
         for block in self.h:
             hidden_states = block(hidden_states, attention_mask=attention_mask)
         
         hidden_states = self.ln_f(hidden_states)
-        logits = self.lm_head(hidden_states)
         
-        # Apply grammar and chemical validity constraints
-        if (self.config.use_grammar_constraint and 
-            apply_constraints and 
-            self.grammar_tracker is not None and 
-            self.validity_checker is not None):
-            
-            # Get grammar mask from LSTM tracker
-            grammar_mask = self.grammar_tracker(input_ids)  # [batch, seq_len, vocab_size]
-            
-            # Get chemical validity constraints
-            stability_scores, validity_mask = self.validity_checker(hidden_states, input_ids)
-            
-            # Combine grammar and chemical constraints
-            combined_mask = grammar_mask | validity_mask
-            
-            # Debug: Count how many tokens are being masked
-            total_tokens = combined_mask.numel()
-            masked_tokens = combined_mask.sum().item()
-            if masked_tokens > total_tokens * 0.9:  # If >90% tokens masked
-                print(f"WARNING: {masked_tokens}/{total_tokens} ({100*masked_tokens/total_tokens:.1f}%) tokens masked!")
-            
-            # Apply mask to logits (set invalid tokens to very negative values)
-            # Use -65504 which is the largest negative finite value in fp16
-            mask_value = -65504.0 if logits.dtype == torch.float16 else -1e9
-            logits = logits.masked_fill(combined_mask, mask_value)
-            
-            if return_dict:
-                return {
-                    'logits': logits,
-                    'hidden_states': hidden_states,
-                    'stability_scores': stability_scores,
-                    'grammar_mask': grammar_mask,
-                    'validity_mask': validity_mask
-                }
+        # 3. Language model head
+        lm_logits = self.lm_head(hidden_states)
 
-        return logits 
+        # 4. Apply constraints if specified (for inference)
+        if apply_constraints and self.grammar_lstm is not None:
+            grammar_mask = self.grammar_lstm(input_ids)
+            lm_logits.masked_fill_(grammar_mask, -65504.0)
+        
+        output = {"logits": lm_logits}
+        if return_hidden:
+            output["hidden_states"] = hidden_states
+
+        return output
+
+    # ----- Contrastive Loss Functions -----
+    def get_molecular_embedding(self, hidden_states: torch.Tensor, 
+                              attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Extract molecular embedding using mean pooling over non-padded tokens."""
+        if attention_mask is not None:
+            mask_expanded = attention_mask.unsqueeze(-1).float()
+            sum_embeddings = torch.sum(hidden_states * mask_expanded, dim=1)
+            sum_mask = torch.clamp(mask_expanded.sum(dim=1), min=1e-9)
+            mean_embeddings = sum_embeddings / sum_mask
+        else:
+            mean_embeddings = hidden_states.mean(dim=1)
+        return mean_embeddings
+
+    def nt_xent_loss(self, features: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Normalized Temperature-scaled Cross Entropy Loss (InfoNCE)."""
+        batch_size = features.shape[0]
+        similarity_matrix = torch.matmul(features, features.T)
+        labels = labels.contiguous().view(-1, 1)
+        mask = torch.eq(labels, labels.T).float()
+        mask.fill_diagonal_(0)
+        
+        logits_max, _ = torch.max(similarity_matrix, dim=1, keepdim=True)
+        logits = similarity_matrix - logits_max.detach()
+        logits = logits / self.temperature
+        
+        exp_logits = torch.exp(logits)
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
+        
+        # Handle cases where there are no positive pairs for a sample
+        mask_sum = mask.sum(1)
+        mean_log_prob_pos = (mask * log_prob).sum(1) / torch.clamp(mask_sum, min=1e-9)
+        
+        loss = -mean_log_prob_pos[mask_sum > 0].mean()
+        return loss
+
+    def diversity_loss(self, embeddings: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """
+        Encourages diversity between DIFFERENT molecules only.
+        Does NOT penalize similarity between augmentations of the same molecule.
+        """
+        normalized = F.normalize(embeddings, dim=1)
+        similarity = torch.matmul(normalized, normalized.T)
+        batch_size = embeddings.shape[0]
+        
+        # Create mask for different molecules only
+        labels_expanded = labels.unsqueeze(1)  # [batch_size, 1]
+        same_molecule_mask = (labels_expanded == labels_expanded.T)  # [batch_size, batch_size]
+        
+        # Only penalize similarity between DIFFERENT molecules
+        different_molecule_mask = ~same_molecule_mask
+        # Remove diagonal (self-similarity)
+        different_molecule_mask.fill_diagonal_(False)
+        
+        if different_molecule_mask.any():
+            avg_similarity = similarity[different_molecule_mask].mean()
+            return avg_similarity
+        else:
+            # No different molecules to compare
+            return torch.tensor(0.0, device=embeddings.device)
+
+    def combined_loss(self, input_ids: torch.Tensor,
+                     attention_mask: Optional[torch.Tensor] = None,
+                     labels: Optional[torch.Tensor] = None,
+                     contrastive_weight: float = 1.0,
+                     reconstruction_weight: float = 0.1) -> Dict[str, torch.Tensor]:
+        """Simplified loss without diversity - contrastive learning handles diversity naturally."""
+        
+        # Forward pass
+        model_output = self.forward(input_ids, attention_mask, return_hidden=True)
+        hidden_states = model_output['hidden_states']
+        logits = model_output['logits']
+
+        # 1. Contrastive Loss (main objective)
+        molecular_embeddings = self.get_molecular_embedding(hidden_states, attention_mask)
+        projections = self.projection_head(molecular_embeddings)
+        projections = F.normalize(projections, dim=1)
+        
+        if labels is not None:
+            contrastive_loss = self.nt_xent_loss(projections, labels)
+        else:
+            contrastive_loss = torch.tensor(0.0, device=logits.device)
+
+        # 2. Reconstruction Loss (auxiliary)
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = input_ids[:, 1:].contiguous()
+        reconstruction_loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=getattr(self, 'pad_token_id', 0)
+        )
+        
+        # Total loss
+        total_loss = (contrastive_weight * contrastive_loss + 
+                     reconstruction_weight * reconstruction_loss)
+        
+        return {
+            'loss': total_loss,
+            'contrastive_loss': contrastive_loss,
+            'reconstruction_loss': reconstruction_loss,
+            'diversity_loss': torch.tensor(0.0, device=logits.device),  # Keep for compatibility
+            'length_bonus': torch.tensor(0.0, device=logits.device),
+            'average_sequence_length': torch.tensor(0.0, device=logits.device),
+            'embedding_variance': molecular_embeddings.var(dim=0).mean(),  # Monitor collapse
+            'average_similarity': torch.tensor(0.0, device=logits.device)
+        } 

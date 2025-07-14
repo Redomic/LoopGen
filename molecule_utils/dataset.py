@@ -5,7 +5,7 @@ import pandas as pd
 import math
 import random
 
-from .tokenizer import SELFIETokenizer
+from .tokenizer import SELFIESTokenizer
 
 def count_lines(file_path: str) -> int:
     """Counts the number of lines in a file, skipping the header."""
@@ -25,7 +25,7 @@ class SELFIESDataset(IterableDataset):
     def __init__(
         self, 
         file_path: str, 
-        tokenizer: SELFIETokenizer, 
+        tokenizer: SELFIESTokenizer, 
         max_length: int,
         total_lines: int,
         split: str = 'train',
@@ -131,7 +131,7 @@ class FixedSizeSELFIESDataset(Dataset):
     A map-style dataset for a fixed-size validation set.
     Reads a portion of the CSV file into memory.
     """
-    def __init__(self, file_path: str, tokenizer: SELFIETokenizer, max_length: int, num_samples: int, total_lines: int):
+    def __init__(self, file_path: str, tokenizer: SELFIESTokenizer, max_length: int, num_samples: int, total_lines: int):
         self.tokenizer = tokenizer
         self.max_length = max_length
         

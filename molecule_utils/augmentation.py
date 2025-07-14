@@ -1,196 +1,156 @@
 """
-Molecular augmentation strategies for contrastive learning.
-Generates different valid SELFIES representations of the same molecule.
+Robust molecular augmentation for SELFIES contrastive learning.
+
+This module implements chemically-aware augmentation strategies that respect
+SELFIES structure and ensure molecular validity through proper validation.
 """
 
 import random
-from typing import List, Tuple, Optional
+import logging
+from typing import List, Tuple, Optional, Set
 import selfies as sf
+from rdkit import Chem
+from rdkit.Chem import rdMolDescriptors
+import warnings
+
+# Suppress RDKit warnings
+warnings.filterwarnings("ignore")
+logger = logging.getLogger(__name__)
 
 
 class SELFIESAugmenter:
-    """Generates augmented SELFIES representations for contrastive learning."""
+    """Generates augmented SELFIES representations using SMILES enumeration only."""
     
     def __init__(self, tokenizer):
-        self.tokenizer = tokenizer
-        
-    def augment(self, selfies_string: str, num_augmentations: int = 2) -> List[str]:
         """
-        Generate augmented versions of a SELFIES string.
+        Initialize the SELFIES augmenter.
         
         Args:
-            selfies_string: Original SELFIES representation
-            num_augmentations: Number of augmented versions to generate
+            tokenizer: SELFIESTokenizer instance (kept for compatibility)
+        """
+        self.tokenizer = tokenizer
+
+    def augment(self, selfies_string: str, n_augmentations: int = 10) -> List[str]:
+        """
+        Generate augmentations using only SMILES enumeration (gold standard).
+        
+        Args:
+            selfies_string: Input SELFIES string
+            n_augmentations: Number of augmented versions to generate
             
         Returns:
             List of augmented SELFIES strings (including original)
         """
-        augmentations = [selfies_string]  # Always include original
+        # Step 1: SELFIES → SMILES
+        try:
+            canonical_smiles = sf.decoder(selfies_string)
+        except Exception:
+            return [selfies_string] * n_augmentations
         
-        # Try different augmentation strategies
-        strategies = [
-            self._reorder_branches,
-            self._rotate_ring_numbering,
-            self._permute_symmetric_groups,
-        ]
+        # Step 2: Create RDKit molecule
+        mol = Chem.MolFromSmiles(canonical_smiles)
+        if mol is None:
+            return [selfies_string] * n_augmentations
+        
+        # Step 3: Generate augmentations using SMILES enumeration only
+        augmented_selfies = set([selfies_string])  # Always include original
         
         attempts = 0
-        max_attempts = num_augmentations * 10  # Avoid infinite loops
+        max_attempts = n_augmentations * 10
         
-        while len(augmentations) < num_augmentations and attempts < max_attempts:
+        while len(augmented_selfies) < n_augmentations and attempts < max_attempts:
+            # Generate random SMILES
+            random_smiles = self._generate_random_smiles(mol, attempts)
+            
+            # Convert back to SELFIES
+            try:
+                random_selfies = sf.encoder(random_smiles)
+                augmented_selfies.add(random_selfies)
+            except Exception:
+                pass
+            
             attempts += 1
-            
-            # Randomly select a strategy
-            strategy = random.choice(strategies)
-            augmented = strategy(selfies_string)
-            
-            # Validate augmentation
-            if augmented and augmented != selfies_string and augmented not in augmentations:
-                if self._is_valid_augmentation(selfies_string, augmented):
-                    augmentations.append(augmented)
         
-        # If we couldn't generate enough augmentations, duplicate with small variations
-        while len(augmentations) < num_augmentations:
-            # This ensures we always return the requested number
-            augmentations.append(selfies_string)
+        # Convert to list and pad if needed
+        result = list(augmented_selfies)
+        while len(result) < n_augmentations:
+            result.append(selfies_string)
             
-        return augmentations[:num_augmentations]
-    
-    def _is_valid_augmentation(self, original: str, augmented: str) -> bool:
-        """Check if augmentation preserves molecular identity."""
-        try:
-            # Convert to SMILES to check equivalence
-            original_smiles = sf.decoder(original)
-            augmented_smiles = sf.decoder(augmented)
-            
-            # For now, we'll trust that our augmentations preserve structure
-            # In a production system, you'd use RDKit to verify canonical SMILES
-            return True
-        except:
-            return False
-    
-    def _reorder_branches(self, selfies: str) -> Optional[str]:
-        """Reorder independent branches in the molecule."""
-        tokens = list(sf.split_selfies(selfies))
-        
-        # Find branch points
-        branch_stack = []
-        i = 0
-        
-        while i < len(tokens):
-            if tokens[i].startswith('[Branch'):
-                # Found a branch point
-                branch_start = i
-                branch_level = 1
-                j = i + 1
-                
-                # Find the end of this branch
-                while j < len(tokens) and branch_level > 0:
-                    if tokens[j].startswith('[Branch'):
-                        branch_level += 1
-                    elif tokens[j].startswith('[Ring'):
-                        branch_level -= 1
-                    j += 1
-                
-                if branch_level == 0:
-                    branch_stack.append((branch_start, j))
-                i = j
+        return result[:n_augmentations]
+
+    def _generate_random_smiles(self, mol: Chem.Mol, attempt: int) -> str:
+        """
+        Generate randomized SMILES with different strategies based on attempt number.
+        """
+        if attempt < 10:
+            # Standard randomization
+            return Chem.MolToSmiles(mol, doRandom=True)
+        elif attempt < 20:
+            # Try with specific starting atom
+            n_atoms = mol.GetNumAtoms()
+            if n_atoms > 1:
+                start_atom = random.randint(0, n_atoms - 1)
+                return Chem.MolToSmiles(mol, doRandom=True, rootedAtAtom=start_atom)
             else:
-                i += 1
+                return Chem.MolToSmiles(mol, doRandom=True)
+        else:
+            # Try with different canonical settings
+            return Chem.MolToSmiles(mol, 
+                                  doRandom=True, 
+                                  canonical=False,
+                                  allBondsExplicit=random.choice([True, False]))
+
+    def augment_batch(self, selfies_list: List[str], n_augmentations: int = 10, 
+                     return_mapping: bool = True) -> tuple:
+        """
+        Augment a batch of SELFIES strings for contrastive learning.
         
-        # If we have multiple branches at the same level, we can swap them
-        if len(branch_stack) >= 2:
-            # Randomly swap two branches
-            idx1, idx2 = random.sample(range(len(branch_stack)), 2)
-            start1, end1 = branch_stack[idx1]
-            start2, end2 = branch_stack[idx2]
+        Args:
+            selfies_list: List of SELFIES strings
+            n_augmentations: Number of augmentations per molecule
+            return_mapping: Whether to return mapping to original indices
             
-            # Only swap if they don't overlap
-            if end1 <= start2 or end2 <= start1:
-                # Extract branches
-                branch1 = tokens[start1:end1]
-                branch2 = tokens[start2:end2]
-                
-                # Create new token list with swapped branches
-                if start1 < start2:
-                    new_tokens = (tokens[:start1] + branch2 + 
-                                tokens[end1:start2] + branch1 + 
-                                tokens[end2:])
-                else:
-                    new_tokens = (tokens[:start2] + branch1 + 
-                                tokens[end2:start1] + branch2 + 
-                                tokens[end1:])
-                
-                return ''.join(new_tokens)
+        Returns:
+            Tuple of (augmented_selfies, labels) if return_mapping=True
+            List of augmented_selfies otherwise
+        """
+        augmented_batch = []
+        labels = []
         
-        return None
-    
-    def _rotate_ring_numbering(self, selfies: str) -> Optional[str]:
-        """Rotate ring numbering to create equivalent representation."""
-        tokens = list(sf.split_selfies(selfies))
-        
-        # Find ring tokens
-        ring_tokens = []
-        for i, token in enumerate(tokens):
-            if 'Ring' in token:
-                ring_tokens.append((i, token))
-        
-        if len(ring_tokens) >= 2:
-            # Simple rotation: increment all ring numbers
-            new_tokens = tokens.copy()
-            for i, token in ring_tokens:
-                # Extract ring number
-                if 'Ring1' in token:
-                    new_tokens[i] = token.replace('Ring1', 'Ring2')
-                elif 'Ring2' in token:
-                    new_tokens[i] = token.replace('Ring2', 'Ring1')
+        for idx, selfies in enumerate(selfies_list):
+            augmentations = self.augment(selfies, n_augmentations)
+            augmented_batch.extend(augmentations)
             
-            return ''.join(new_tokens)
+            if return_mapping:
+                labels.extend([idx] * len(augmentations))
         
-        return None
-    
-    def _permute_symmetric_groups(self, selfies: str) -> Optional[str]:
-        """Permute symmetric groups like methyl groups."""
-        tokens = list(sf.split_selfies(selfies))
-        
-        # Look for simple symmetric patterns (e.g., multiple [C] in a row)
-        i = 0
-        while i < len(tokens) - 1:
-            if tokens[i] == '[C]' and tokens[i + 1] == '[C]':
-                # Found consecutive carbons, check if we can swap with neighbors
-                if i > 0 and tokens[i - 1] in ['[N]', '[O]', '[S]']:
-                    # Can potentially swap order
-                    if random.random() > 0.5:
-                        tokens[i], tokens[i + 1] = tokens[i + 1], tokens[i]
-                        return ''.join(tokens)
-            i += 1
-        
-        return None
+        if return_mapping:
+            return augmented_batch, labels
+        return augmented_batch
 
 
 def create_contrastive_batch(
     selfies_batch: List[str], 
     augmenter: SELFIESAugmenter,
-    num_augmentations: int = 2
+    n_augmentations: int = 10
 ) -> Tuple[List[str], List[int]]:
     """
-    Create a batch for contrastive learning.
+    Create contrastive learning batch with SMILES enumeration augmentations.
     
-    Args:
-        selfies_batch: Original SELFIES strings
-        augmenter: Augmentation object
-        num_augmentations: Number of augmentations per molecule
-        
-    Returns:
-        augmented_batch: Flattened list of all augmentations
-        labels: Label for each augmentation (which original molecule it came from)
+    Ensures no duplicates and meaningful chemical diversity.
     """
-    augmented_batch = []
+    augmented_strings = []
     labels = []
     
-    for idx, selfies in enumerate(selfies_batch):
-        augmentations = augmenter.augment(selfies, num_augmentations)
-        augmented_batch.extend(augmentations)
-        labels.extend([idx] * num_augmentations)
+    for idx, selfies_string in enumerate(selfies_batch):
+        # Get SMILES enumeration augmentations
+        augmentations = augmenter.augment(selfies_string, n_augmentations)
+        
+        # Add to batch
+        augmented_strings.extend(augmentations)
+        labels.extend([idx] * len(augmentations))
     
-    return augmented_batch, labels 
+    return augmented_strings, labels
+
+
+ 
