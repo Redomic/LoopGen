@@ -7,6 +7,7 @@ SELFIES structure and ensure molecular validity through proper validation.
 
 import random
 import logging
+import gc
 from typing import List, Tuple, Optional, Set
 import selfies as sf
 from rdkit import Chem
@@ -52,31 +53,39 @@ class SELFIESAugmenter:
         if mol is None:
             return [selfies_string] * n_augmentations
         
-        # Step 3: Generate augmentations using SMILES enumeration only
-        augmented_selfies = set([selfies_string])  # Always include original
-        
-        attempts = 0
-        max_attempts = n_augmentations * 10
-        
-        while len(augmented_selfies) < n_augmentations and attempts < max_attempts:
-            # Generate random SMILES
-            random_smiles = self._generate_random_smiles(mol, attempts)
+        try:
+            # Step 3: Generate augmentations using SMILES enumeration only
+            augmented_selfies = set([selfies_string])  # Always include original
             
-            # Convert back to SELFIES
+            attempts = 0
+            max_attempts = n_augmentations * 10
+            
+            while len(augmented_selfies) < n_augmentations and attempts < max_attempts:
+                # Generate random SMILES
+                random_smiles = self._generate_random_smiles(mol, attempts)
+                
+                # Convert back to SELFIES
+                try:
+                    random_selfies = sf.encoder(random_smiles)
+                    augmented_selfies.add(random_selfies)
+                except Exception:
+                    pass
+                
+                attempts += 1
+            
+            # Convert to list and pad if needed
+            result = list(augmented_selfies)
+            while len(result) < n_augmentations:
+                result.append(selfies_string)
+            
+            return result[:n_augmentations]
+            
+        finally:
+            # Ensure molecule is always cleaned up
             try:
-                random_selfies = sf.encoder(random_smiles)
-                augmented_selfies.add(random_selfies)
-            except Exception:
+                del mol
+            except:
                 pass
-            
-            attempts += 1
-        
-        # Convert to list and pad if needed
-        result = list(augmented_selfies)
-        while len(result) < n_augmentations:
-            result.append(selfies_string)
-            
-        return result[:n_augmentations]
 
     def _generate_random_smiles(self, mol: Chem.Mol, attempt: int) -> str:
         """
@@ -136,8 +145,6 @@ def create_contrastive_batch(
 ) -> Tuple[List[str], List[int]]:
     """
     Create contrastive learning batch with SMILES enumeration augmentations.
-    
-    Ensures no duplicates and meaningful chemical diversity.
     """
     augmented_strings = []
     labels = []
@@ -149,6 +156,10 @@ def create_contrastive_batch(
         # Add to batch
         augmented_strings.extend(augmentations)
         labels.extend([idx] * len(augmentations))
+        
+        # Less frequent cleanup for large batches only
+        if len(selfies_batch) > 1000 and idx % 200 == 0 and idx > 0:
+            gc.collect()
     
     return augmented_strings, labels
 
