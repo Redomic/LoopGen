@@ -914,6 +914,16 @@ class SELFIESGPTDecoder(nn.Module):
         molecular_embeddings = self.get_molecular_embedding(hidden_states, attention_mask)
         projections = self.projection_head(molecular_embeddings)
         projections = F.normalize(projections, dim=1)
+
+        with torch.no_grad():
+            similarity_matrix = torch.matmul(projections, projections.T)
+            print(f"Similarity stats - Mean: {similarity_matrix.mean():.3f}, Std: {similarity_matrix.std():.3f}")
+            print(f"Max similarity: {similarity_matrix.max():.3f}, Min: {similarity_matrix.min():.3f}")
+            # Additional debug: check if projections are diverse
+            print(f"Projection norm mean: {projections.norm(dim=1).mean():.3f}")
+            print(f"Projection std: {projections.std():.3f}")
+            print(f"Before projection std: {molecular_embeddings.std():.4f}")
+            print(f"After projection std: {projections.std():.4f}")
         
         if labels is not None:
             contrastive_loss = self.nt_xent_loss(projections, labels)

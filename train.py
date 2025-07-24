@@ -298,6 +298,8 @@ def train(args, tokenizer, device):
     
     # Model, optimizer, scaler
     model = SELFIESGPTDecoder(config).to(device)
+
+    model.temperature = args.contrastive_temperature
     
     # Initialize clean loss components
     model.reconstruction_loss_fn = ReconstructionLoss(
@@ -414,6 +416,7 @@ def main():
     train_group.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay")
     train_group.add_argument("--grad_accumulation_steps", type=int, default=1, help="Gradient accumulation steps")
     train_group.add_argument("--n_augmentations", type=int, default=10, help="Augmentations per sample")
+    train_group.add_argument("--contrastive_temperature", type=float, default=0.1, help="Temperature for contrastive loss")
     train_group.add_argument("--alpha", type=float, default=1.0, help="Weight for contrastive loss")
     train_group.add_argument("--beta", type=float, default=0.5, help="Weight for reconstruction loss")
 
