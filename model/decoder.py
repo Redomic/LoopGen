@@ -750,8 +750,19 @@ class SELFIESGPTDecoder(nn.Module):
         
         # Input embeddings
         self.wte = nn.Embedding(config.vocab_size, config.d_model)
+        nn.init.orthogonal_(self.wte.weight)
         # Positional embeddings (always needed for base embeddings)
         self.wpe = nn.Embedding(config.max_seq_len, config.d_model)
+        
+        # CRITICAL FIX: Add embedding projection and scaling
+        self.embed_scale = nn.Parameter(torch.tensor(1.0))
+        self.pos_scale = nn.Parameter(torch.tensor(0.02))
+        
+        # Add input layer norm for large models
+        if config.d_model > 256:
+            self.input_ln = nn.LayerNorm(config.d_model, eps=config.layer_norm_eps)
+        else:
+            self.input_ln = nn.Identity()
         
         self.drop = nn.Dropout(config.dropout)
         self.h = nn.ModuleList([DecoderBlock(config, i) for i in range(config.n_layers)])
@@ -763,15 +774,22 @@ class SELFIESGPTDecoder(nn.Module):
             self.lm_head.weight = self.wte.weight
 
         # ----- Contrastive Learning Components -----
-        # Projection head for projecting hidden states to a contrastive space
+        # Projection head for projecting hidden states to a contrastive space        
         self.projection_head = nn.Sequential(
             nn.Linear(config.d_model, config.d_model),
+            nn.LayerNorm(config.d_model),  # LayerNorm instead of BatchNorm
             nn.ReLU(),
-            nn.Dropout(0.1), 
-            nn.Linear(config.d_model, 256),  
-            nn.ReLU(),
-            nn.Linear(256, 256)  
+            nn.Linear(config.d_model, 256)
         )
+
+        for layer in self.projection_head:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                if layer.bias is not None:
+                    nn.init.zeros_(layer.bias)
+
+        # self.projection_head = nn.Linear(config.d_model, 256)
+        # nn.init.normal_(self.projection_head.weight, std=1.0)
 
         self.temperature = 0.1 # For NT-Xent loss
         # -----------------------------------------
@@ -784,15 +802,26 @@ class SELFIESGPTDecoder(nn.Module):
         self.robust_loss_fn = None
         self.anti_collapse_regularizer = None
 
+        # CRITICAL FIX: Custom initialization for larger models
         self.apply(self._init_weights)
-
+        
+        # Override initialization for embeddings in larger models
+        if config.d_model > 256:
+            with torch.no_grad():
+                # Use smaller std for position embeddings
+                nn.init.normal_(self.wpe.weight, mean=0.0, std=0.02)
+                # Keep token embeddings with default init
+                nn.init.normal_(self.wte.weight, mean=0.0, std=1.0/math.sqrt(config.d_model))
+            
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            # Standard transformer initialization
+            std = 1.0 / math.sqrt(self.config.d_model)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
 
     def forward(
         self, 
@@ -810,12 +839,16 @@ class SELFIESGPTDecoder(nn.Module):
         tok_embeds = self.wte(input_ids)
         pos_ids = torch.arange(0, seq_len, dtype=torch.long, device=device).unsqueeze(0)
         pos_embeds = self.wpe(pos_ids)
-        hidden_states = tok_embeds + pos_embeds
+        
+        # CRITICAL FIX: Scale embeddings separately
+        hidden_states = tok_embeds + 0.02 * pos_embeds
 
         if branch_depths is not None and self.branch_embed is not None:
-             branch_embeds = self.branch_embed(branch_depths)
-             hidden_states = hidden_states + branch_embeds
+            branch_embeds = self.branch_embed(branch_depths)
+            hidden_states = hidden_states + branch_embeds
 
+        # CRITICAL FIX: Apply input layer norm for variance control
+        hidden_states = self.input_ln(hidden_states)
         hidden_states = self.drop(hidden_states)
         
         # 2. Transformer blocks
@@ -839,17 +872,14 @@ class SELFIESGPTDecoder(nn.Module):
         return output
 
     # ----- Contrastive Loss Functions -----
-    def get_molecular_embedding(self, hidden_states: torch.Tensor, 
-                              attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Extract molecular embedding using mean pooling over non-padded tokens."""
+    def get_molecular_embedding(self, hidden_states, attention_mask=None):
+        # Get the last non-padded token for each sequence
         if attention_mask is not None:
-            mask_expanded = attention_mask.unsqueeze(-1).float()
-            sum_embeddings = torch.sum(hidden_states * mask_expanded, dim=1)
-            sum_mask = torch.clamp(mask_expanded.sum(dim=1), min=1e-9)
-            mean_embeddings = sum_embeddings / sum_mask
+            seq_lengths = attention_mask.sum(dim=1) - 1
+            batch_idx = torch.arange(hidden_states.size(0))
+            return hidden_states[batch_idx, seq_lengths]
         else:
-            mean_embeddings = hidden_states.mean(dim=1)
-        return mean_embeddings
+            return hidden_states[:, -1, :]  # Last token
 
     def nt_xent_loss(self, features: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         """Normalized Temperature-scaled Cross Entropy Loss (InfoNCE)."""
@@ -912,7 +942,12 @@ class SELFIESGPTDecoder(nn.Module):
 
         # 1. Contrastive Loss (main objective)
         molecular_embeddings = self.get_molecular_embedding(hidden_states, attention_mask)
+        molecular_embeddings_norm = F.normalize(molecular_embeddings, dim=1)
+        sim_before = torch.matmul(molecular_embeddings_norm, molecular_embeddings_norm.T)
+        print(f"Similarity BEFORE projection: {sim_before.mean():.3f}")
         projections = self.projection_head(molecular_embeddings)
+        print(f"Before normalization - Mean: {projections.mean():.3f}, Std: {projections.std():.3f}")
+        print(f"Before normalization - Norm: {projections.norm(dim=1).mean():.3f}")
         projections = F.normalize(projections, dim=1)
 
         with torch.no_grad():

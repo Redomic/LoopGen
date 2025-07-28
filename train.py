@@ -300,6 +300,7 @@ def train(args, tokenizer, device):
     model = SELFIESGPTDecoder(config).to(device)
 
     model.temperature = args.contrastive_temperature
+    print(f"Set model temperature to: {model.temperature}")
     
     # Initialize clean loss components
     model.reconstruction_loss_fn = ReconstructionLoss(
