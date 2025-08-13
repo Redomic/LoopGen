@@ -27,7 +27,7 @@ class ModelConfig:
     use_cache: bool = True              # Key-value caching
     tie_word_embeddings: bool = False   # Tie input/output embeddings
     
-    # SELFIES-specific features (now disabled by default for robustness)
+    # SELFIES-specific features (deprecated; SELFIES ensures validity)
     use_grammar_constraint: bool = False
     branch_depth_embedding_dim: int = 64
     max_branch_depth: int = 16
@@ -53,6 +53,10 @@ class ModelConfig:
         
         if self.d_ff is None:
             self.d_ff = 4 * self.d_model
+
+        # Soft-deprecate grammar/chemistry constraints
+        if self.use_grammar_constraint:
+            print("Warning: use_grammar_constraint is deprecated and will be ignored. SELFIES already enforces validity.")
 
     @classmethod
     def from_dict(cls, config_dict):

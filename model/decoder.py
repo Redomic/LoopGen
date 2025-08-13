@@ -2,111 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-import random
-from typing import Optional, Dict, Set, List, Tuple, Any
+from typing import Optional, Dict, Any
 from .config import ModelConfig
-
-class RobustLoss(nn.Module):
-    """
-    Robust loss function that prevents model collapse by enforcing
-    minimum sequence lengths and penalizing trivial solutions.
-    """
-    def __init__(self, tokenizer, min_length: int = 20, length_penalty_weight: float = 5.0):
-        super().__init__()
-        self.tokenizer = tokenizer
-        self.min_length = min_length
-        self.length_penalty_weight = length_penalty_weight
-        
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor, input_ids: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        Compute robust cross-entropy loss with anti-collapse penalties.
-        
-        Args:
-            logits: Model predictions [batch, seq_len, vocab_size]
-            targets: Target token IDs [batch, seq_len]
-            input_ids: Original input sequence [batch, seq_len]
-        """
-        # Standard cross-entropy loss
-        ce_loss = F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)),
-            targets.reshape(-1),
-            ignore_index=self.tokenizer.pad_token_id,
-            reduction='mean'
-        )
-        
-        # Length enforcement: penalize sequences that are too short
-        actual_lengths = (input_ids != self.tokenizer.pad_token_id).sum(dim=1).float()
-        length_shortfall = torch.clamp(self.min_length - actual_lengths, min=0.0)
-        length_penalty = length_shortfall.mean() * self.length_penalty_weight
-        
-        # Early EOS penalty: discourage premature sequence termination
-        eos_mask = (input_ids == self.tokenizer.eos_token_id)
-        if eos_mask.any():
-            # Find first EOS position for each sequence
-            eos_positions = torch.where(eos_mask, torch.arange(input_ids.size(1), device=input_ids.device), input_ids.size(1))
-            first_eos = eos_positions.min(dim=1)[0].float()
-            early_eos_penalty = torch.clamp(self.min_length - first_eos, min=0.0).mean() * self.length_penalty_weight
-        else:
-            early_eos_penalty = torch.tensor(0.0, device=logits.device)
-        
-        total_loss = ce_loss + length_penalty + early_eos_penalty
-        
-        return {
-            'loss': total_loss,
-            'ce_loss': ce_loss,
-            'length_penalty': length_penalty,
-            'early_eos_penalty': early_eos_penalty
-        }
-
-class AntiCollapseRegularizer(nn.Module):
-    """
-    Regularization module that prevents embedding collapse and enforces diversity.
-    """
-    def __init__(self, min_embedding_std: float = 0.1, max_similarity: float = 0.8):
-        super().__init__()
-        self.min_embedding_std = min_embedding_std
-        self.max_similarity = max_similarity
-        
-    def forward(self, embeddings: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        Compute anti-collapse regularization losses.
-        
-        Args:
-            embeddings: Molecular embeddings [batch_size, embedding_dim]
-        """
-        batch_size, embed_dim = embeddings.shape
-        
-        # Prevent embedding collapse: ensure sufficient standard deviation
-        embedding_std = torch.std(embeddings, dim=0)  # [embed_dim]
-        std_shortfall = torch.clamp(self.min_embedding_std - embedding_std, min=0.0)
-        std_penalty = std_shortfall.mean() * 10.0
-        
-        # Prevent excessive similarity between different molecular embeddings
-        if batch_size > 1:
-            # Normalize embeddings for cosine similarity
-            normalized_embeddings = F.normalize(embeddings, dim=1)
-            similarity_matrix = torch.mm(normalized_embeddings, normalized_embeddings.t())
-            
-            # Mask out diagonal (self-similarity)
-            mask = ~torch.eye(batch_size, dtype=torch.bool, device=embeddings.device)
-            off_diagonal_similarities = similarity_matrix[mask]
-            
-            # Penalize if average similarity is too high
-            avg_similarity = off_diagonal_similarities.mean()
-            similarity_excess = torch.clamp(avg_similarity - self.max_similarity, min=0.0)
-            similarity_penalty = similarity_excess * 5.0
-        else:
-            similarity_penalty = torch.tensor(0.0, device=embeddings.device)
-        
-        total_penalty = std_penalty + similarity_penalty
-        
-        return {
-            'anti_collapse_loss': total_penalty,
-            'std_penalty': std_penalty,
-            'similarity_penalty': similarity_penalty,
-            'avg_embedding_std': embedding_std.mean(),
-            'avg_similarity': similarity_penalty  # Reuse for logging
-        }
 
 class TrainingStabilizer:
     """
@@ -388,50 +285,6 @@ class ReconstructionLoss(nn.Module):
             'average_entropy': entropy[valid_mask].mean() if valid_mask.any() else torch.tensor(0.0, device=logits.device)
         }
 
-class DiversityRegularizer(nn.Module):
-    """
-    Clean diversity regularization without excessive constraints.
-    """
-    
-    def __init__(self, regularization_strength: float = 0.1):
-        super().__init__()
-        self.regularization_strength = regularization_strength
-    
-    def forward(self, embeddings: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        Compute diversity regularization.
-        
-        Args:
-            embeddings: Molecular embeddings [batch_size, embedding_dim]
-        """
-        batch_size = embeddings.size(0)
-        
-        if batch_size <= 1:
-            return {
-                'diversity_loss': torch.tensor(0.0, device=embeddings.device),
-                'embedding_variance': torch.tensor(0.0, device=embeddings.device)
-            }
-        
-        # Encourage diversity through cosine similarity penalty
-        normalized_embeddings = F.normalize(embeddings, dim=1)
-        similarity_matrix = torch.mm(normalized_embeddings, normalized_embeddings.t())
-        
-        # Mask diagonal and compute off-diagonal similarity
-        mask = ~torch.eye(batch_size, dtype=torch.bool, device=embeddings.device)
-        off_diagonal_similarities = similarity_matrix[mask]
-        
-        # Penalize high similarity (encourage diversity)
-        diversity_loss = off_diagonal_similarities.mean() * self.regularization_strength
-        
-        # Monitor embedding variance
-        embedding_variance = torch.var(embeddings, dim=0).mean()
-        
-        return {
-            'diversity_loss': diversity_loss,
-            'embedding_variance': embedding_variance,
-            'average_similarity': off_diagonal_similarities.mean()
-        }
-
 class SwiGLU(nn.Module):
     """ SwiGLU activation function: SiLU(x) * Linear(x) """
     def forward(self, x):
@@ -453,160 +306,6 @@ def get_alibi_slopes(n_heads: int) -> torch.Tensor:
             torch.tensor(get_slopes_power_of_2(closest_power_of_2)),
             torch.tensor(get_slopes_power_of_2(2*closest_power_of_2))[0::2][:n_heads-closest_power_of_2]
         ])
-
-class GrammarLSTM(nn.Module):
-    """
-    LSTM-based grammar state tracker for SELFIES molecules.
-    Tracks structural context like branch depth, ring states, and bond connectivity.
-    """
-    def __init__(self, config: ModelConfig):
-        super().__init__()
-        self.config = config
-        self.hidden_size = 128  # Smaller hidden size for grammar tracking
-        
-        # LSTM for tracking sequential grammar state
-        self.lstm = nn.LSTM(
-            input_size=config.vocab_size,  # One-hot token inputs
-            hidden_size=self.hidden_size,
-            num_layers=2,
-            batch_first=True,
-            dropout=0.1
-        )
-        
-        # Track different grammar states
-        self.branch_depth_tracker = nn.Linear(self.hidden_size, config.max_branch_depth)
-        self.ring_state_tracker = nn.Linear(self.hidden_size, 8)  # Max 8 rings
-        self.bond_context_tracker = nn.Linear(self.hidden_size, 16)  # Bond context states
-        
-        # Grammar validity predictor
-        self.validity_head = nn.Linear(self.hidden_size, config.vocab_size)
-        
-        # Special token tracking
-        self.register_buffer("special_tokens", torch.tensor([0, 1, 2, 3]))  # PAD, BOS, EOS, MASK
-        
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """
-        Returns a mask indicating which tokens are grammatically valid at each position.
-        """
-        batch_size, seq_len = input_ids.shape
-        device = input_ids.device
-        
-        # Convert to one-hot for LSTM input
-        one_hot = F.one_hot(input_ids, num_classes=self.config.vocab_size).float()
-        
-        # Initialize LSTM hidden state
-        h0 = torch.zeros(2, batch_size, self.hidden_size, device=device)
-        c0 = torch.zeros(2, batch_size, self.hidden_size, device=device)
-        
-        # Process sequence through LSTM
-        lstm_out, _ = self.lstm(one_hot, (h0, c0))
-        
-        # Predict validity for next tokens
-        validity_logits = self.validity_head(lstm_out)  # [batch, seq_len, vocab_size]
-        
-        # Create grammar mask (True = invalid, False = valid)
-        grammar_mask = torch.sigmoid(validity_logits) < 0.5
-        
-        # Always allow special tokens
-        for special_token_id in self.special_tokens:
-            if special_token_id < self.config.vocab_size:
-                grammar_mask[:, :, special_token_id] = False
-        
-        return grammar_mask
-
-class ChemicalValidityModule(nn.Module):
-    """
-    Module for ensuring chemical validity of generated SELFIES.
-    Tracks valence, formal charges, and molecular stability constraints.
-    """
-    def __init__(self, config: ModelConfig):
-        super().__init__()
-        self.config = config
-        
-        # Atom property embeddings
-        self.atom_embedding = nn.Embedding(config.vocab_size, 64)
-        
-        # Valence tracking network
-        self.valence_tracker = nn.Sequential(
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, 8),  # Max valence of 8
-            nn.Softmax(dim=-1)
-        )
-        
-        # Formal charge tracker
-        self.charge_tracker = nn.Sequential(
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, 7)  # Charges from -3 to +3
-        )
-        
-        # Molecular stability predictor
-        self.stability_predictor = nn.Sequential(
-            nn.Linear(config.d_model, 256),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(256, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1),
-            nn.Sigmoid()
-        )
-        
-        # Chemical rule constraints
-        self.register_chemical_rules()
-        
-    def register_chemical_rules(self):
-        """Register basic chemical validity rules."""
-        # Common atom valences (simplified)
-        self.atom_valences = {
-            'C': [4],           # Carbon: valence 4
-            'N': [3, 5],        # Nitrogen: valence 3 or 5
-            'O': [2],           # Oxygen: valence 2
-            'S': [2, 4, 6],     # Sulfur: valence 2, 4, or 6
-            'P': [3, 5],        # Phosphorus: valence 3 or 5
-            'F': [1],           # Fluorine: valence 1
-            'Cl': [1],          # Chlorine: valence 1
-            'Br': [1],          # Bromine: valence 1
-            'I': [1]            # Iodine: valence 1
-        }
-        
-    def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns stability scores and validity constraints.
-        """
-        batch_size, seq_len, _ = hidden_states.shape
-        
-        # Predict molecular stability
-        stability_scores = self.stability_predictor(hidden_states)  # [batch, seq_len, 1]
-        
-        # Get atom embeddings for chemical analysis
-        atom_embeds = self.atom_embedding(input_ids)  # [batch, seq_len, 64]
-        
-        # Predict valence requirements
-        valence_probs = self.valence_tracker(atom_embeds)  # [batch, seq_len, 8]
-        
-        # Predict formal charges
-        charge_logits = self.charge_tracker(atom_embeds)  # [batch, seq_len, 7]
-        
-        # Create validity mask based on chemical rules
-        validity_mask = self._apply_chemical_rules(input_ids, valence_probs, charge_logits)
-        
-        return stability_scores, validity_mask
-    
-    def _apply_chemical_rules(self, input_ids: torch.Tensor, valence_probs: torch.Tensor, 
-                            charge_logits: torch.Tensor) -> torch.Tensor:
-        """Apply basic chemical validity rules."""
-        batch_size, seq_len = input_ids.shape
-        device = input_ids.device
-        
-        # Initialize as all valid
-        validity_mask = torch.zeros(batch_size, seq_len, self.config.vocab_size, 
-                                  dtype=torch.bool, device=device)
-        
-        # Apply valence rules (simplified implementation)
-        # In practice, this would involve more sophisticated chemical logic
-        
-        return validity_mask
 
 class Attention(nn.Module):
     """ Multi-Head Self-Attention with ALiBi and Flash Attention. """
@@ -741,8 +440,13 @@ class DecoderBlock(nn.Module):
 
 class SELFIESGPTDecoder(nn.Module):
     """
-    GPT-style decoder model for SELFIES generation and representation learning.
-    This model can be used for both generative and contrastive training.
+    Autoregressive GPT-style decoder model for SELFIES molecular generation.
+    
+    This model learns to generate molecules by:
+    1. Reconstruction loss - Learning to speak "molecular SELFIES"
+    2. (Future) Protein conditioning - Learning to listen to "protein language"
+    
+    The model is purely generative without contrastive learning components.
     """
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -751,14 +455,15 @@ class SELFIESGPTDecoder(nn.Module):
         # Input embeddings
         self.wte = nn.Embedding(config.vocab_size, config.d_model)
         nn.init.orthogonal_(self.wte.weight)
-        # Positional embeddings (always needed for base embeddings)
+        # Positional embeddings
         self.wpe = nn.Embedding(config.max_seq_len, config.d_model)
+        # High dropout on embeddings to encourage robustness
+        self.embed_dropout = nn.Dropout(config.dropout)
         
-        # CRITICAL FIX: Add embedding projection and scaling
-        self.embed_scale = nn.Parameter(torch.tensor(1.0))
-        self.pos_scale = nn.Parameter(torch.tensor(0.02))
+        # Fixed positional scaling for stability (keep simple and deterministic)
+        self.pos_scale: float = 1.0
         
-        # Add input layer norm for large models
+        # Input layer norm for large models
         if config.d_model > 256:
             self.input_ln = nn.LayerNorm(config.d_model, eps=config.layer_norm_eps)
         else:
@@ -772,37 +477,19 @@ class SELFIESGPTDecoder(nn.Module):
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         if config.tie_word_embeddings:
             self.lm_head.weight = self.wte.weight
+        
+        # TODO: Add protein encoder module here for conditioning
+        # self.protein_encoder = ProteinEncoder(config) if config.use_protein_conditioning else None
 
-        # ----- Contrastive Learning Components -----
-        # Projection head for projecting hidden states to a contrastive space        
-        self.projection_head = nn.Sequential(
-            nn.Linear(config.d_model, config.d_model),
-            nn.LayerNorm(config.d_model),  # LayerNorm instead of BatchNorm
-            nn.ReLU(),
-            nn.Linear(config.d_model, 256)
-        )
-
-        for layer in self.projection_head:
-            if isinstance(layer, nn.Linear):
-                nn.init.xavier_uniform_(layer.weight)
-                if layer.bias is not None:
-                    nn.init.zeros_(layer.bias)
-
-        # self.projection_head = nn.Linear(config.d_model, 256)
-        # nn.init.normal_(self.projection_head.weight, std=1.0)
-
-        self.temperature = 0.1 # For NT-Xent loss
-        # -----------------------------------------
-
-        # Optional grammar and chemical validity modules
-        self.grammar_lstm = GrammarLSTM(config) if config.use_grammar_constraint else None
-        self.chem_validity = ChemicalValidityModule(config) if config.use_grammar_constraint else None
-
-        # Robust loss components (initialized separately with tokenizer)
-        self.robust_loss_fn = None
-        self.anti_collapse_regularizer = None
-
-        # CRITICAL FIX: Custom initialization for larger models
+        # Deprecated: grammar/chemistry constraints
+        if hasattr(config, 'use_grammar_constraint') and config.use_grammar_constraint:
+            print("Warning: Grammar/Chemistry constraints are deprecated and disabled. SELFIES ensures validity; set use_grammar_constraint=False.")
+        
+        # Label smoothing for reconstruction loss
+        self.label_smoothing = 0.1
+        self.pad_token_id = 0  # Will be set by tokenizer
+        
+        # Initialize weights
         self.apply(self._init_weights)
         
         # Override initialization for embeddings in larger models
@@ -826,28 +513,42 @@ class SELFIESGPTDecoder(nn.Module):
     def forward(
         self, 
         input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None, 
-        branch_depths: Optional[torch.Tensor] = None,
-        return_hidden: bool = False,
+        attention_mask: Optional[torch.Tensor] = None,
+        protein_embeddings: Optional[torch.Tensor] = None,  # TODO: For future protein conditioning
         apply_constraints: bool = False
     ) -> Dict[str, torch.Tensor]:
+        """
+        Forward pass through the autoregressive decoder.
         
+        Args:
+            input_ids: Token IDs [batch_size, seq_len]
+            attention_mask: Attention mask [batch_size, seq_len]
+            protein_embeddings: Protein conditioning embeddings [batch_size, protein_dim] (future)
+            apply_constraints: Backward-compat flag (no-op). Grammar/chem constraints are removed.
+        
+        Returns:
+            Dictionary with 'logits' and optionally 'hidden_states'
+        """
         batch_size, seq_len = input_ids.size()
         device = input_ids.device
         
         # 1. Get embeddings
-        tok_embeds = self.wte(input_ids)
+        tok_embeds = self.embed_dropout(self.wte(input_ids))
         pos_ids = torch.arange(0, seq_len, dtype=torch.long, device=device).unsqueeze(0)
         pos_embeds = self.wpe(pos_ids)
         
-        # CRITICAL FIX: Scale embeddings separately
-        hidden_states = tok_embeds + 0.02 * pos_embeds
-
-        if branch_depths is not None and self.branch_embed is not None:
-            branch_embeds = self.branch_embed(branch_depths)
-            hidden_states = hidden_states + branch_embeds
-
-        # CRITICAL FIX: Apply input layer norm for variance control
+        # Scale embeddings for stability
+        hidden_states = tok_embeds + self.pos_scale * pos_embeds
+        # Add training-time Gaussian noise to improve robustness
+        if self.training:
+            hidden_states = hidden_states + torch.randn_like(hidden_states) * 0.1
+        
+        # TODO: Add protein conditioning here
+        # if protein_embeddings is not None and self.protein_encoder is not None:
+        #     protein_context = self.protein_encoder(protein_embeddings)
+        #     hidden_states = hidden_states + protein_context.unsqueeze(1)  # Broadcast to all positions
+        
+        # Apply input layer norm and dropout
         hidden_states = self.input_ln(hidden_states)
         hidden_states = self.drop(hidden_states)
         
@@ -859,137 +560,264 @@ class SELFIESGPTDecoder(nn.Module):
         
         # 3. Language model head
         lm_logits = self.lm_head(hidden_states)
-
-        # 4. Apply constraints if specified (for inference)
-        if apply_constraints and self.grammar_lstm is not None:
-            grammar_mask = self.grammar_lstm(input_ids)
-            lm_logits.masked_fill_(grammar_mask, -65504.0)
         
-        output = {"logits": lm_logits}
-        if return_hidden:
-            output["hidden_states"] = hidden_states
-
-        return output
-
-    # ----- Contrastive Loss Functions -----
-    def get_molecular_embedding(self, hidden_states, attention_mask=None):
-        # Get the last non-padded token for each sequence
-        if attention_mask is not None:
-            seq_lengths = attention_mask.sum(dim=1) - 1
-            batch_idx = torch.arange(hidden_states.size(0))
-            return hidden_states[batch_idx, seq_lengths]
-        else:
-            return hidden_states[:, -1, :]  # Last token
-
-    def nt_xent_loss(self, features: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        """Normalized Temperature-scaled Cross Entropy Loss (InfoNCE)."""
-        batch_size = features.shape[0]
-        similarity_matrix = torch.matmul(features, features.T)
-        labels = labels.contiguous().view(-1, 1)
-        mask = torch.eq(labels, labels.T).float()
-        mask.fill_diagonal_(0)
+        # 4. Constraints removed; rely on SELFIES validity and sampling controls
         
-        logits_max, _ = torch.max(similarity_matrix, dim=1, keepdim=True)
-        logits = similarity_matrix - logits_max.detach()
-        logits = logits / self.temperature
-        
-        exp_logits = torch.exp(logits)
-        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
-        
-        # Handle cases where there are no positive pairs for a sample
-        mask_sum = mask.sum(1)
-        mean_log_prob_pos = (mask * log_prob).sum(1) / torch.clamp(mask_sum, min=1e-9)
-        
-        loss = -mean_log_prob_pos[mask_sum > 0].mean()
-        return loss
+        return {"logits": lm_logits, "hidden_states": hidden_states}
 
-    def diversity_loss(self, embeddings: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    def set_tokenizer(self, tokenizer):
+        """Set tokenizer to get special token IDs."""
+        self.pad_token_id = tokenizer.pad_token_id
+        self.eos_token_id = tokenizer.eos_token_id
+        self.bos_token_id = tokenizer.bos_token_id
+
+    def compute_loss(self, 
+                    input_ids: torch.Tensor,
+                    attention_mask: Optional[torch.Tensor] = None,
+                    protein_embeddings: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """
-        Encourages diversity between DIFFERENT molecules only.
-        Does NOT penalize similarity between augmentations of the same molecule.
+        Compute autoregressive reconstruction loss for molecular generation.
+        
+        This is the core training objective: learning to predict the next token
+        in a SELFIES sequence, optionally conditioned on protein context.
+        
+        Args:
+            input_ids: Token IDs [batch_size, seq_len]
+            attention_mask: Attention mask [batch_size, seq_len]
+            protein_embeddings: Protein conditioning (future implementation)
+        
+        Returns:
+            Dictionary with loss components
         """
-        normalized = F.normalize(embeddings, dim=1)
-        similarity = torch.matmul(normalized, normalized.T)
-        batch_size = embeddings.shape[0]
-        
-        # Create mask for different molecules only
-        labels_expanded = labels.unsqueeze(1)  # [batch_size, 1]
-        same_molecule_mask = (labels_expanded == labels_expanded.T)  # [batch_size, batch_size]
-        
-        # Only penalize similarity between DIFFERENT molecules
-        different_molecule_mask = ~same_molecule_mask
-        # Remove diagonal (self-similarity)
-        different_molecule_mask.fill_diagonal_(False)
-        
-        if different_molecule_mask.any():
-            avg_similarity = similarity[different_molecule_mask].mean()
-            return avg_similarity
-        else:
-            # No different molecules to compare
-            return torch.tensor(0.0, device=embeddings.device)
-
-    def combined_loss(self, input_ids: torch.Tensor,
-                     attention_mask: Optional[torch.Tensor] = None,
-                     labels: Optional[torch.Tensor] = None,
-                     contrastive_weight: float = 1.0,
-                     reconstruction_weight: float = 0.1) -> Dict[str, torch.Tensor]:
-        """Simplified loss without diversity - contrastive learning handles diversity naturally."""
-        
         # Forward pass
-        model_output = self.forward(input_ids, attention_mask, return_hidden=True)
-        hidden_states = model_output['hidden_states']
+        model_output = self.forward(input_ids, attention_mask, protein_embeddings)
         logits = model_output['logits']
-
-        # 1. Contrastive Loss (main objective)
-        molecular_embeddings = self.get_molecular_embedding(hidden_states, attention_mask)
-        molecular_embeddings_norm = F.normalize(molecular_embeddings, dim=1)
-        sim_before = torch.matmul(molecular_embeddings_norm, molecular_embeddings_norm.T)
-        print(f"Similarity BEFORE projection: {sim_before.mean():.3f}")
-        projections = self.projection_head(molecular_embeddings)
-        print(f"Before normalization - Mean: {projections.mean():.3f}, Std: {projections.std():.3f}")
-        print(f"Before normalization - Norm: {projections.norm(dim=1).mean():.3f}")
-        projections = F.normalize(projections, dim=1)
-
-        with torch.no_grad():
-            similarity_matrix = torch.matmul(projections, projections.T)
-            print(f"Similarity stats - Mean: {similarity_matrix.mean():.3f}, Std: {similarity_matrix.std():.3f}")
-            print(f"Max similarity: {similarity_matrix.max():.3f}, Min: {similarity_matrix.min():.3f}")
-            # Additional debug: check if projections are diverse
-            print(f"Projection norm mean: {projections.norm(dim=1).mean():.3f}")
-            print(f"Projection std: {projections.std():.3f}")
-            print(f"Before projection std: {molecular_embeddings.std():.4f}")
-            print(f"After projection std: {projections.std():.4f}")
+        logits = torch.clamp(logits, min=-10, max=10)
         
-        if labels is not None:
-            contrastive_loss = self.nt_xent_loss(projections, labels)
-        else:
-            contrastive_loss = torch.tensor(0.0, device=logits.device)
-
-        # 2. Reconstruction Loss (auxiliary) with label smoothing
+        # Shift for next-token prediction
+        # Input: [BOS, tok1, tok2, ...]
+        # Target: [tok1, tok2, ..., EOS]
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = input_ids[:, 1:].contiguous()
         
-        # Use label smoothing to prevent overconfident predictions
-        label_smoothing_fn = LabelSmoothingCrossEntropy(
-            epsilon=0.1,
-            ignore_index=getattr(self, 'pad_token_id', 0)
-        )
-        reconstruction_loss = label_smoothing_fn(
+        # Reconstruction loss with label smoothing
+        # Label smoothing prevents overconfident predictions and improves generation diversity
+        if self.label_smoothing > 0:
+            loss_fn = LabelSmoothingCrossEntropy(
+                epsilon=self.label_smoothing,
+                ignore_index=self.pad_token_id
+            )
+        else:
+            loss_fn = nn.CrossEntropyLoss(ignore_index=self.pad_token_id)
+        
+        reconstruction_loss = loss_fn(
             shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1)
         )
         
-        # Total loss
-        total_loss = (contrastive_weight * contrastive_loss + 
-                     reconstruction_weight * reconstruction_loss)
+        # Calculate metrics and debug statistics
+        with torch.no_grad():
+            perplexity = torch.exp(reconstruction_loss)
+            
+            # Calculate sequence lengths for monitoring
+            if attention_mask is not None:
+                seq_lengths = attention_mask.sum(dim=1).float()
+                avg_seq_length = seq_lengths.mean()
+                max_seq_length = seq_lengths.max()
+                min_seq_length = seq_lengths.min()
+            else:
+                avg_seq_length = torch.tensor(float(input_ids.size(1)), device=input_ids.device)
+                max_seq_length = avg_seq_length
+                min_seq_length = avg_seq_length
+            
+            # Logits statistics
+            logits_mean = shift_logits.mean()
+            logits_std = shift_logits.std()
+            logits_max = shift_logits.max()
+            logits_min = shift_logits.min()
+            
+            # Prediction confidence (entropy)
+            probs = F.softmax(shift_logits, dim=-1)
+            entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=-1)
+            avg_entropy = entropy.mean()
+            
+            # Token prediction accuracy (for monitoring)
+            predicted_tokens = shift_logits.argmax(dim=-1)
+            correct_predictions = (predicted_tokens == shift_labels).float()
+            if attention_mask is not None:
+                # Only count non-padded tokens
+                valid_mask = attention_mask[:, 1:].bool()  # Skip BOS token
+                accuracy = correct_predictions[valid_mask].mean()
+            else:
+                accuracy = correct_predictions.mean()
+
+            # Additional debug: compare real-token vs padding accuracy and distribution
+            pad_mask = (shift_labels == self.pad_token_id)
+            non_pad_mask = ~pad_mask
+            real_token_acc = correct_predictions[non_pad_mask].mean() if non_pad_mask.any() else torch.tensor(0.0, device=logits.device)
+            pad_token_acc = correct_predictions[pad_mask].mean() if pad_mask.any() else torch.tensor(0.0, device=logits.device)
+            total_tokens = shift_labels.numel()
+            pad_tokens = pad_mask.sum().item()
+            real_tokens = non_pad_mask.sum().item()
+            
+            # Hidden state statistics (from last layer)
+            hidden_states = model_output['hidden_states']
+            hidden_mean = hidden_states.mean()
+            hidden_std = hidden_states.std()
+            hidden_norm = hidden_states.norm(dim=-1).mean()
+        
+        # Enhanced debug output with similarity and normalization stats
+        if hasattr(self, '_debug_step_count'):
+            self._debug_step_count += 1
+        else:
+            self._debug_step_count = 1
+            
+        # Calculate additional debug metrics (similar to old contrastive model)
+        with torch.no_grad():
+            # Hidden state similarity analysis
+            batch_size = hidden_states.size(0)
+            if batch_size > 1:
+                # Get sequence representations (mean pooling)
+                if attention_mask is not None:
+                    mask_expanded = attention_mask.unsqueeze(-1).expand_as(hidden_states)
+                    sequence_representations = (hidden_states * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1)
+                else:
+                    sequence_representations = hidden_states.mean(dim=1)
+                
+                # Normalize and compute similarity
+                seq_repr_norm = F.normalize(sequence_representations, dim=1)
+                similarity_matrix = torch.matmul(seq_repr_norm, seq_repr_norm.T)
+                
+                # Remove diagonal for similarity stats
+                similarity_no_diag = similarity_matrix[~torch.eye(batch_size, dtype=torch.bool, device=hidden_states.device)]
+                similarity_mean = similarity_no_diag.mean()
+                similarity_std = similarity_no_diag.std()
+                similarity_max = similarity_no_diag.max()
+                similarity_min = similarity_no_diag.min()
+            else:
+                similarity_mean = torch.tensor(0.0, device=hidden_states.device)
+                similarity_std = torch.tensor(0.0, device=hidden_states.device)
+                similarity_max = torch.tensor(0.0, device=hidden_states.device)
+                similarity_min = torch.tensor(0.0, device=hidden_states.device)
+            
+            # Token embedding analysis
+            token_embeddings = self.wte.weight
+            token_emb_mean = token_embeddings.mean()
+            token_emb_std = token_embeddings.std()
+            token_emb_norm = token_embeddings.norm(dim=1).mean()
+            
+            # Output layer analysis
+            output_weight = self.lm_head.weight
+            output_weight_mean = output_weight.mean()
+            output_weight_std = output_weight.std()
+            output_weight_norm = output_weight.norm(dim=1).mean()
+            
+        # Print detailed stats every N steps (similar to old model)
+        if self._debug_step_count % 50 == 0:
+            print(f"\n=== Autoregressive Model Debug Stats (Step {self._debug_step_count}) ===")
+            print(f"Sequence similarity BEFORE normalization: {similarity_mean:.3f}")
+            print(f"Hidden states - Mean: {hidden_mean:.3f}, Std: {hidden_std:.3f}")
+            print(f"Hidden state norm: {hidden_norm:.3f}")
+            print(f"Similarity stats - Mean: {similarity_mean:.3f}, Std: {similarity_std:.3f}")
+            print(f"Max similarity: {similarity_max:.3f}, Min: {similarity_min:.3f}")
+            print(f"Hidden representation std: {hidden_std:.4f}")
+            print(f"Token embeddings - Mean: {token_emb_mean:.4f}, Std: {token_emb_std:.4f}, Norm: {token_emb_norm:.3f}")
+            print(f"Output weights - Mean: {output_weight_mean:.4f}, Std: {output_weight_std:.4f}, Norm: {output_weight_norm:.3f}")
+            print(f"Loss: {reconstruction_loss:.4f}, Perplexity: {perplexity:.2f}")
+            print(f"Prediction accuracy: {accuracy:.3f}, Avg entropy: {avg_entropy:.3f}")
+            print(f"Token distribution: {real_tokens}/{total_tokens} real ({(real_tokens/total_tokens*100 if total_tokens>0 else 0):.1f}%), {pad_tokens}/{total_tokens} padding")
+            print(f"Accuracy - Real tokens: {real_token_acc:.3f}, Padding: {pad_token_acc:.3f}")
+            print(f"Logits - Mean: {logits_mean:.3f}, Std: {logits_std:.3f}, Range: [{logits_min:.2f}, {logits_max:.2f}]")
         
         return {
-            'loss': total_loss,
-            'contrastive_loss': contrastive_loss,
+            'loss': reconstruction_loss,
             'reconstruction_loss': reconstruction_loss,
-            'diversity_loss': torch.tensor(0.0, device=logits.device),  # Keep for compatibility
-            'length_bonus': torch.tensor(0.0, device=logits.device),
-            'average_sequence_length': torch.tensor(0.0, device=logits.device),
-            'embedding_variance': molecular_embeddings.var(dim=0).mean(),  # Monitor collapse
-            'average_similarity': torch.tensor(0.0, device=logits.device)
-        } 
+            'perplexity': perplexity,
+            'average_sequence_length': avg_seq_length,
+            'accuracy': accuracy,
+            'entropy': avg_entropy,
+            'logits_std': logits_std,
+            'hidden_std': hidden_std,
+            'hidden_norm': hidden_norm
+        }
+    
+    @torch.no_grad()
+    def generate(self,
+                prompt_ids: Optional[torch.Tensor] = None,
+                protein_embeddings: Optional[torch.Tensor] = None,
+                max_length: int = 256,
+                temperature: float = 1.0,
+                top_k: int = 50,
+                top_p: float = 0.95,
+                num_return_sequences: int = 1) -> torch.Tensor:
+        """
+        Generate molecular SELFIES sequences autoregressively.
+        
+        Args:
+            prompt_ids: Optional prompt tokens [batch_size, prompt_len]
+            protein_embeddings: Protein conditioning (future)
+            max_length: Maximum generation length
+            temperature: Sampling temperature
+            top_k: Top-k sampling
+            top_p: Nucleus sampling threshold
+            num_return_sequences: Number of sequences to generate
+        
+        Returns:
+            Generated token IDs [num_sequences, seq_len]
+        """
+        device = next(self.parameters()).device
+        
+        if prompt_ids is None:
+            # Start with BOS token
+            prompt_ids = torch.tensor([[self.bos_token_id]], device=device)
+        
+        # Expand for multiple sequences
+        if num_return_sequences > 1:
+            prompt_ids = prompt_ids.repeat(num_return_sequences, 1)
+            if protein_embeddings is not None:
+                protein_embeddings = protein_embeddings.repeat(num_return_sequences, 1)
+        
+        generated = prompt_ids
+        
+        for _ in range(max_length - prompt_ids.size(1)):
+            # Get logits for next token
+            outputs = self.forward(generated, protein_embeddings=protein_embeddings)
+            next_token_logits = outputs['logits'][:, -1, :] / temperature
+            
+            # Apply top-k and top-p filtering
+            filtered_logits = self._top_k_top_p_filtering(next_token_logits, top_k, top_p)
+            
+            # Sample next token
+            probs = F.softmax(filtered_logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            
+            # Append to generated sequence
+            generated = torch.cat([generated, next_token], dim=1)
+            
+            # Stop if all sequences have generated EOS
+            if (next_token == self.eos_token_id).all():
+                break
+        
+        return generated
+    
+    def _top_k_top_p_filtering(self, logits, top_k=50, top_p=0.95):
+        """Apply top-k and nucleus (top-p) filtering to logits."""
+        # Top-k filtering
+        if top_k > 0:
+            indices_to_remove = logits < torch.topk(logits, top_k, dim=-1)[0][..., -1, None]
+            logits[indices_to_remove] = -float('inf')
+        
+        # Top-p filtering
+        if top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+            
+            # Remove tokens with cumulative probability above threshold
+            sorted_indices_to_remove = cumulative_probs > top_p
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+            sorted_indices_to_remove[..., 0] = 0
+            
+            indices_to_remove = sorted_indices_to_remove.scatter(-1, sorted_indices, sorted_indices_to_remove)
+            logits[indices_to_remove] = -float('inf')
+        
+        return logits 

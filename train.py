@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-Training script for SELFIES GPT decoder using contrastive learning.
+Training script for autoregressive SELFIES GPT decoder.
+
+This trains a pure generative model using reconstruction loss to learn
+molecular SELFIES generation. Future versions will add protein conditioning.
 """
 import argparse
 import json
@@ -12,19 +15,19 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Optional
-from functools import partial
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.amp import GradScaler, autocast
 from tqdm import tqdm
+import pandas as pd
+import numpy as np
 
 from model.config import ModelConfig
-from model.decoder import SELFIESGPTDecoder, ReconstructionLoss, DiversityRegularizer, TrainingStabilizer
+from model.decoder import SELFIESGPTDecoder
 from molecule_utils.tokenizer import SELFIESTokenizer
 from molecule_utils.dataset import SELFIESDataset, collate_fn, count_lines
-from molecule_utils.augmentation import SELFIESAugmenter, create_contrastive_batch
 
 # region: Logging and Directory Setup
 # ==============================================================================
@@ -62,18 +65,23 @@ def save_run_config(args: argparse.Namespace, run_dir: Path, tokenizer: SELFIEST
     
     logging.info("Saved run configuration")
 
-def save_training_metrics(run_dir: Path, epoch: int, train_metrics: Dict, val_loss: float, lr: float):
+def save_training_metrics(run_dir: Path, epoch: int, train_metrics: Dict, val_metrics: Dict, lr: float):
     """Save training metrics to a JSON file."""
     metrics_file = run_dir / "metrics.jsonl"
     
     metrics_entry = {
         'epoch': epoch,
         'timestamp': datetime.now().isoformat(),
-        'train_loss': train_metrics['total_loss'],
-        'train_contrastive_loss': train_metrics['contrastive_loss'],
+        'train_loss': train_metrics['loss'],
         'train_reconstruction_loss': train_metrics['reconstruction_loss'],
-        'train_diversity_loss': train_metrics['diversity_loss'],
-        'val_loss': val_loss,
+        'train_perplexity': train_metrics.get('perplexity', 0),
+        'train_accuracy': train_metrics.get('accuracy', 0),
+        'train_entropy': train_metrics.get('entropy', 0),
+        'val_loss': val_metrics['loss'],
+        'val_reconstruction_loss': val_metrics['reconstruction_loss'],
+        'val_perplexity': val_metrics.get('perplexity', 0),
+        'val_accuracy': val_metrics.get('accuracy', 0),
+        'val_entropy': val_metrics.get('entropy', 0),
         'learning_rate': lr
     }
     
@@ -86,45 +94,73 @@ def save_training_metrics(run_dir: Path, epoch: int, train_metrics: Dict, val_lo
 # region: Core Training Functions
 # ==============================================================================
 
-def _contrastive_collate_fn(batch: List[torch.Tensor], tokenizer: SELFIESTokenizer, augmenter: SELFIESAugmenter, n_augmentations: int) -> Dict[str, torch.Tensor]:
-    """Custom collate function for contrastive learning."""
-    selfies_strings = [tokenizer.decode(t.tolist(), skip_special_tokens=True) for t in batch]
-    augmented_strings, labels = create_contrastive_batch(selfies_strings, augmenter, n_augmentations)
-    
-    max_len = max(len(tokenizer.encode(s, add_special_tokens=True)) for s in augmented_strings)
+def analyze_sequence_lengths(data_path: str, tokenizer: SELFIESTokenizer, n_samples: int = 10000):
+    """Analyze actual sequence lengths in the dataset."""
+    lengths = []
+    for chunk in pd.read_csv(data_path, usecols=['SELFIES'], chunksize=1000):
+        # Respect n_samples cap
+        if len(lengths) >= n_samples:
+            break
+        take = max(0, n_samples - len(lengths))
+        for selfies in chunk['SELFIES'][:take]:
+            if isinstance(selfies, str):
+                tokens = tokenizer.encode(selfies, add_special_tokens=True)
+                lengths.append(len(tokens))
+    if not lengths:
+        print("No sequences found for length analysis.")
+        return
+    print(f"\nSequence Length Analysis (n={len(lengths)}):")
+    print(f"  Mean: {np.mean(lengths):.1f}")
+    print(f"  Median: {np.median(lengths):.1f}")
+    print(f"  Min: {min(lengths)}, Max: {max(lengths)}")
+    print(f"  Std: {np.std(lengths):.1f}")
+    print(f"  95th percentile: {np.percentile(lengths, 95):.1f}")
+
+def _autoregressive_collate_fn(batch: List[torch.Tensor], tokenizer: SELFIESTokenizer, max_seq_len: int = 256) -> Dict[str, torch.Tensor]:
+    """Dynamic padding collate function with optional cap."""
+    # Find the maximum length in this specific batch
+    max_len = min(max(len(t) for t in batch), max_seq_len)
     
     input_ids = []
-    for s in augmented_strings:
-        encoded = tokenizer.encode(s, add_special_tokens=True)
-        encoded.extend([tokenizer.pad_token_id] * (max_len - len(encoded)))
-        input_ids.append(torch.tensor(encoded[:max_len], dtype=torch.long))
+    for t in batch:
+        if len(t) > max_len:
+            padded = t[:max_len]
+        else:
+            padded = torch.cat([
+                t,
+                torch.full((max_len - len(t),), tokenizer.pad_token_id, dtype=torch.long)
+            ])
+        input_ids.append(padded)
+    
+    input_ids = torch.stack(input_ids)
+    attention_mask = (input_ids != tokenizer.pad_token_id).long()
     
     return {
-        'input_ids': torch.stack(input_ids),
-        'attention_mask': (torch.stack(input_ids) != tokenizer.pad_token_id).long(),
-        'labels': torch.tensor(labels, dtype=torch.long)
+        'input_ids': input_ids,
+        'attention_mask': attention_mask
     }
 
-def _train_epoch(model: SELFIESGPTDecoder, loader: DataLoader, optimizer: torch.optim.Optimizer, scaler: GradScaler, device: torch.device, args: argparse.Namespace):
-    """Train one epoch with proper stability monitoring."""
+def _train_epoch(model: SELFIESGPTDecoder, loader: DataLoader, optimizer: torch.optim.Optimizer, scaler: GradScaler, device: torch.device, args: argparse.Namespace) -> Dict[str, float]:
+    """Train one epoch with autoregressive reconstruction loss."""
     model.train()
-    total_loss, total_contrastive, total_recon, total_div = 0.0, 0.0, 0.0, 0.0
+    total_loss = 0.0
+    total_perplexity = 0.0
+    total_accuracy = 0.0
+    total_entropy = 0.0
+    num_batches = 0
     
     progress_bar = tqdm(enumerate(loader), total=len(loader), desc="Training")
     
     for i, batch in progress_bar:
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
-        labels = batch['labels'].to(device)
         
         with autocast(device.type, enabled=args.use_amp):
-            # Use updated parameter names
-            loss_dict = model.combined_loss(
-                input_ids, 
-                attention_mask, 
-                labels, 
-                contrastive_weight=args.alpha, 
-                reconstruction_weight=args.beta
+            # Compute autoregressive loss
+            loss_dict = model.compute_loss(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                protein_embeddings=None  # TODO: Add protein conditioning
             )
             
             loss = loss_dict['loss'] / args.grad_accumulation_steps
@@ -132,82 +168,93 @@ def _train_epoch(model: SELFIESGPTDecoder, loader: DataLoader, optimizer: torch.
         scaler.scale(loss).backward()
         
         if (i + 1) % args.grad_accumulation_steps == 0:
-            # Simple gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
             
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
-
-        # Update metrics for logging
-        total_loss += loss_dict['loss'].item()
-        total_contrastive += loss_dict['contrastive_loss'].item()
-        total_recon += loss_dict['reconstruction_loss'].item()
-        total_div += loss_dict['diversity_loss'].item()
         
-        # Update progress bar
+        # Update metrics
+        total_loss += loss_dict['loss'].item()
+        total_perplexity += loss_dict['perplexity'].item()
+        total_accuracy += loss_dict['accuracy'].item()
+        total_entropy += loss_dict['entropy'].item()
+        num_batches += 1
+        
+        # Update progress bar with more detailed stats
         progress_bar.set_postfix({
             'loss': f"{loss_dict['loss'].item():.3f}",
-            'cont': f"{loss_dict['contrastive_loss'].item():.3f}",
-            'recon': f"{loss_dict['reconstruction_loss'].item():.3f}",
-            'div': f"{loss_dict['diversity_loss'].item():.3f}",
-            'length_bonus': f"{loss_dict.get('length_bonus', 0):.4f}"
+            'ppl': f"{loss_dict['perplexity'].item():.2f}",
+            'acc': f"{loss_dict['accuracy'].item():.3f}",
+            'ent': f"{loss_dict['entropy'].item():.2f}",
+            'seq_len': f"{loss_dict['average_sequence_length'].item():.1f}"
         })
     
     return {
-        'total_loss': total_loss / len(loader),
-        'contrastive_loss': total_contrastive / len(loader),
-        'reconstruction_loss': total_recon / len(loader),
-        'diversity_loss': total_div / len(loader)
+        'loss': total_loss / num_batches,
+        'reconstruction_loss': total_loss / num_batches,
+        'perplexity': total_perplexity / num_batches,
+        'accuracy': total_accuracy / num_batches,
+        'entropy': total_entropy / num_batches
     }
 
-def _validate(model: SELFIESGPTDecoder, loader: DataLoader, device: torch.device, args: argparse.Namespace) -> float:
-    """Validate model and return contrastive loss."""
+def _validate(model: SELFIESGPTDecoder, loader: DataLoader, device: torch.device, args: argparse.Namespace) -> Dict[str, float]:
+    """Validate model with reconstruction loss."""
     model.eval()
     total_loss = 0.0
+    total_perplexity = 0.0
+    total_accuracy = 0.0
+    total_entropy = 0.0
+    num_batches = 0
     
     with torch.no_grad():
         for batch in tqdm(loader, desc="Validation"):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
-            labels = batch['labels'].to(device)
+            
             with autocast(device.type, enabled=args.use_amp):
-                loss_dict = model.combined_loss(
-                    input_ids, 
-                    attention_mask, 
-                    labels, 
-                    contrastive_weight=args.alpha, 
-                    reconstruction_weight=args.beta
+                loss_dict = model.compute_loss(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    protein_embeddings=None
                 )
-            total_loss += loss_dict['contrastive_loss'].item()
-    return total_loss / len(loader)
+            
+            total_loss += loss_dict['loss'].item()
+            total_perplexity += loss_dict['perplexity'].item()
+            total_accuracy += loss_dict['accuracy'].item()
+            total_entropy += loss_dict['entropy'].item()
+            num_batches += 1
+    
+    return {
+        'loss': total_loss / num_batches,
+        'reconstruction_loss': total_loss / num_batches,
+        'perplexity': total_perplexity / num_batches,
+        'accuracy': total_accuracy / num_batches,
+        'entropy': total_entropy / num_batches
+    }
 
-def generate_molecules(model: nn.Module, tokenizer: SELFIESTokenizer, device: torch.device, args) -> List[str]:
-    """Generate molecules with advanced sampling."""
+def generate_molecules(model: SELFIESGPTDecoder, tokenizer: SELFIESTokenizer, device: torch.device, args) -> List[str]:
+    """Generate molecules using the model's built-in generation method."""
     model.eval()
+    
+    # Generate multiple sequences
+    generated_ids = model.generate(
+        prompt_ids=None,  # Start from BOS
+        protein_embeddings=None,  # TODO: Add protein conditioning
+        max_length=args.max_seq_len,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        top_p=args.top_p,
+        num_return_sequences=args.num_generated
+    )
+    
+    # Decode to SELFIES strings
     generated_molecules = []
-    with torch.no_grad():
-        for _ in range(args.num_generated):
-            current_sequence = [tokenizer.bos_token_id]
-            for _ in range(args.max_seq_len):
-                input_ids = torch.tensor([current_sequence], device=device)
-                model_output = model(input_ids, apply_constraints=args.use_grammar_constraints)
-                logits = model_output['logits'][0, -1, :]
-                
-                logits = logits / args.temperature
-                if args.top_k > 0:
-                    top_k_vals, _ = torch.topk(logits, args.top_k)
-                    logits[logits < top_k_vals[-1]] = -float('Inf')
-                
-                probs = torch.softmax(logits, dim=-1)
-                next_token_id = torch.multinomial(probs, 1).item()
-
-                if next_token_id == tokenizer.eos_token_id:
-                    break
-                current_sequence.append(next_token_id)
-
-            generated_molecules.append(tokenizer.decode(current_sequence, skip_special_tokens=True))
-    model.train()
+    for seq_ids in generated_ids:
+        selfies_str = tokenizer.decode(seq_ids.tolist(), skip_special_tokens=True)
+        generated_molecules.append(selfies_str)
+    
     return generated_molecules
 
 def save_checkpoint(model, optimizer, scheduler, scaler, epoch, best_val_loss, run_dir):
@@ -265,13 +312,39 @@ def save_generated_molecules(molecules: List[str], run_dir: Path, epoch: int):
 
 # endregion
 
+def analyze_dataset(dataset, name="Dataset"):
+    """Analyze dataset diversity"""
+    samples = []
+    for i, item in enumerate(dataset):
+        if i >= 1000:  # Sample first 1000
+            break
+        samples.append(item)
+    
+    # Check uniqueness
+    unique_samples = len(set([tuple(s.tolist()) for s in samples]))
+    print(f"\n{name} Analysis:")
+    print(f"  Unique sequences in first 1000: {unique_samples}/1000")
+    print(f"  Average length: {sum(len(s) for s in samples)/len(samples):.1f}")
+    
+    # Check diversity (pairwise similarity)
+    if len(samples) > 100:
+        sample_subset = samples[:100]
+        similarities = []
+        for i in range(len(sample_subset)):
+            for j in range(i+1, len(sample_subset)):
+                seq1 = set(sample_subset[i].tolist())
+                seq2 = set(sample_subset[j].tolist())
+                jaccard = len(seq1.intersection(seq2)) / len(seq1.union(seq2))
+                similarities.append(jaccard)
+        print(f"  Average Jaccard similarity: {sum(similarities)/len(similarities):.3f}")
+
 def train(args, tokenizer, device):
-    """Main training loop with anti-collapse mechanisms."""
+    """Main training loop for autoregressive SELFIES generation."""
     # Setup run directory and logging
     run_dir = setup_run_directory(args.output_dir)
     save_run_config(args, run_dir, tokenizer)
     
-    logging.info("Starting Robust Contrastive Training")
+    logging.info("Starting Autoregressive SELFIES Training")
     
     # Config
     if args.model_size == "small": config = ModelConfig.small_config()
@@ -280,7 +353,6 @@ def train(args, tokenizer, device):
     config.vocab_size = tokenizer.vocab_size
 
     # Datasets and loaders
-    augmenter = SELFIESAugmenter(tokenizer)
     total_lines = args.dataset_subset_size or count_lines(args.data_path)
     
     # Ensure validation set is carved out correctly
@@ -292,23 +364,27 @@ def train(args, tokenizer, device):
     train_dataset = SELFIESDataset(args.data_path, tokenizer, config.max_seq_len, total_lines=total_lines, split='train', split_ratio=train_split_ratio)
     val_dataset = SELFIESDataset(args.data_path, tokenizer, config.max_seq_len, total_lines=total_lines, split='val', split_ratio=train_split_ratio)
     
-    collate_partial = partial(_contrastive_collate_fn, tokenizer=tokenizer, augmenter=augmenter, n_augmentations=args.n_augmentations)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_partial)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_partial)
+    # Debug dataset diversity
+    analyze_dataset(train_dataset, "Train")
+    analyze_dataset(val_dataset, "Validation")
+    
+    # Use simple collate function for autoregressive training
+    from functools import partial
+    collate_fn = partial(_autoregressive_collate_fn, tokenizer=tokenizer, max_seq_len=config.max_seq_len)
+    # Note: IterableDataset handles shuffling internally, so we don't use shuffle=True
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_fn)
     
     # Model, optimizer, scaler
     model = SELFIESGPTDecoder(config).to(device)
-
-    model.temperature = args.contrastive_temperature
-    print(f"Set model temperature to: {model.temperature}")
     
-    # Initialize clean loss components
-    model.reconstruction_loss_fn = ReconstructionLoss(
-        pad_token_id=tokenizer.pad_token_id, 
-        min_sequence_length=args.min_generation_length
-    ).to(device)
+    # Set tokenizer for special tokens
+    model.set_tokenizer(tokenizer)
     
-    logging.info(f"Initialized clean loss components (min_length={args.min_generation_length})")
+    # Configure label smoothing
+    model.label_smoothing = args.label_smoothing
+    
+    logging.info(f"Initialized model with label smoothing={args.label_smoothing}")
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scaler = GradScaler(enabled=args.use_amp)
@@ -352,27 +428,31 @@ def train(args, tokenizer, device):
         logging.info(f"Starting Epoch {epoch + 1}/{args.num_epochs}")
         
         train_metrics = _train_epoch(model, train_loader, optimizer, scaler, device, args)
-        val_loss = _validate(model, val_loader, device, args)
+        val_metrics = _validate(model, val_loader, device, args)
         
         # Get current learning rate
         current_lr = optimizer.param_groups[0]['lr']
         
-        # Log metrics
-        logging.info(f"Epoch {epoch + 1} - Train Loss: {train_metrics['total_loss']:.4f}, "
-                    f"Val Loss: {val_loss:.4f}, LR: {current_lr:.2e}")
+        # Log metrics with more detail
+        logging.info(f"Epoch {epoch + 1}")
+        logging.info(f"  Train - Loss: {train_metrics['loss']:.4f}, PPL: {train_metrics['perplexity']:.2f}, "
+                    f"Acc: {train_metrics['accuracy']:.3f}, Ent: {train_metrics['entropy']:.2f}")
+        logging.info(f"  Val   - Loss: {val_metrics['loss']:.4f}, PPL: {val_metrics['perplexity']:.2f}, "
+                    f"Acc: {val_metrics['accuracy']:.3f}, Ent: {val_metrics['entropy']:.2f}")
+        logging.info(f"  LR: {current_lr:.2e}")
         
         # Save metrics to file
-        save_training_metrics(run_dir, epoch + 1, train_metrics, val_loss, current_lr)
+        save_training_metrics(run_dir, epoch + 1, train_metrics, val_metrics, current_lr)
         
         # Update learning rate based on validation loss
-        scheduler.step(val_loss)
+        scheduler.step(val_metrics['loss'])
 
         # Save best model
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if val_metrics['loss'] < best_val_loss:
+            best_val_loss = val_metrics['loss']
             best_model_path = run_dir / "best_model.pt"
             torch.save(model.state_dict(), best_model_path)
-            logging.info(f"Saved best model with validation loss: {val_loss:.4f}")
+            logging.info(f"Saved best model with validation loss: {val_metrics['loss']:.4f}")
 
         # Save checkpoint every epoch (for resuming)
         save_checkpoint(model, optimizer, scheduler, scaler, epoch, best_val_loss, run_dir)
@@ -390,7 +470,7 @@ def train(args, tokenizer, device):
 
 def main():
     """Main entry point for training."""
-    parser = argparse.ArgumentParser(description="Contrastive Training for SELFIES GPT")
+    parser = argparse.ArgumentParser(description="Autoregressive Training for SELFIES GPT Decoder")
 
     # Core arguments
     parser.add_argument("--data_path", type=str, required=True, help="Path to training SMILES file")
@@ -413,28 +493,25 @@ def main():
     train_group = parser.add_argument_group('Training settings')
     train_group.add_argument("--num_epochs", type=int, default=50, help="Number of epochs")
     train_group.add_argument("--batch_size", type=int, default=64, help="Batch size")
-    train_group.add_argument("--learning_rate", type=float, default=3e-4, help="Peak learning rate")
+    train_group.add_argument("--learning_rate", type=float, default=3e-4, help="Learning rate")
     train_group.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay")
     train_group.add_argument("--grad_accumulation_steps", type=int, default=1, help="Gradient accumulation steps")
-    train_group.add_argument("--n_augmentations", type=int, default=10, help="Augmentations per sample")
-    train_group.add_argument("--contrastive_temperature", type=float, default=0.1, help="Temperature for contrastive loss")
-    train_group.add_argument("--alpha", type=float, default=1.0, help="Weight for contrastive loss")
-    train_group.add_argument("--beta", type=float, default=0.5, help="Weight for reconstruction loss")
+    train_group.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping value")
+    train_group.add_argument("--label_smoothing", type=float, default=0.1, help="Label smoothing for reconstruction loss")
 
     
-    # Anti-collapse arguments
-    collapse_group = parser.add_argument_group('Anti-collapse settings')
-    collapse_group.add_argument("--min_generation_length", type=int, default=20, help="Minimum sequence length to prevent collapse")
-    collapse_group.add_argument("--length_penalty_weight", type=float, default=5.0, help="Weight for length penalty")
-    collapse_group.add_argument("--min_embedding_std", type=float, default=0.1, help="Minimum embedding standard deviation")
-    collapse_group.add_argument("--max_similarity", type=float, default=0.8, help="Maximum allowed embedding similarity")
+    # TODO: Protein conditioning arguments (future implementation)
+    # protein_group = parser.add_argument_group('Protein conditioning')
+    # protein_group.add_argument("--protein_encoder_path", type=str, default=None, help="Path to pretrained protein encoder")
+    # protein_group.add_argument("--use_protein_conditioning", action="store_true", help="Enable protein conditioning")
 
     # Generation arguments
     gen_group = parser.add_argument_group('Generation settings')
     gen_group.add_argument("--generate_interval", type=int, default=5, help="Generate samples every N epochs")
     gen_group.add_argument("--num_generated", type=int, default=5, help="Number of molecules to generate")
     gen_group.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
-    gen_group.add_argument("--top_k", type=int, default=0, help="Top-k sampling (0 to disable)")
+    gen_group.add_argument("--top_k", type=int, default=50, help="Top-k sampling (0 to disable)")
+    gen_group.add_argument("--top_p", type=float, default=0.95, help="Nucleus sampling threshold")
     gen_group.add_argument("--use_grammar_constraints", action="store_true", help="Use grammar constraints during generation")
     
     # System arguments
@@ -462,6 +539,9 @@ def main():
         tokenizer = SELFIESTokenizer(vocab_path=str(vocab_path))
     
     print(f"Vocabulary size: {tokenizer.vocab_size}")
+
+    # Analyze sequence length distribution to choose a reasonable cap
+    analyze_sequence_lengths(args.data_path, tokenizer)
 
     # Run training
     train(args, tokenizer, device)

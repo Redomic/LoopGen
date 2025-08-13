@@ -16,6 +16,28 @@ def count_lines(file_path: str) -> int:
     except FileNotFoundError:
         return 0
 
+def get_curriculum_max_length(epoch: int,
+                              total_epochs: int,
+                              min_len: int = 50,
+                              max_len: int = 256) -> int:
+    """Compute curriculum max length that increases linearly over training.
+
+    Args:
+        epoch: Current epoch index (1-based or 0-based supported).
+        total_epochs: Total number of epochs planned.
+        min_len: Starting maximum length.
+        max_len: Final maximum length.
+
+    Returns:
+        Integer maximum length to use for this epoch.
+    """
+    if total_epochs <= 0:
+        return int(max_len)
+    # Support either 0-based or 1-based epoch indexing
+    clamped_epoch = max(0, min(epoch, total_epochs))
+    progress = clamped_epoch / float(total_epochs)
+    return int(min_len + (max_len - min_len) * progress)
+
 class SELFIESDataset(IterableDataset):
     """
     An iterable dataset for reading a large CSV file of SELFIES strings
@@ -55,6 +77,10 @@ class SELFIESDataset(IterableDataset):
 
     def __len__(self):
         return self.length
+
+    def set_max_length(self, new_max_length: int) -> None:
+        """Update maximum sequence length used for truncation/padding."""
+        self.max_length = int(new_max_length)
 
     def _line_iterator(self) -> Iterator[str]:
         """An internal iterator to stream lines from the correct split of the CSV."""
@@ -99,10 +125,7 @@ class SELFIESDataset(IterableDataset):
                 random.shuffle(buffer)
                 for selfies_string in buffer:
                     encoded = self.tokenizer.encode(selfies_string, add_special_tokens=True)
-                    if len(encoded) > self.max_length:
-                        encoded = encoded[:self.max_length]
-                    else:
-                        encoded += [self.tokenizer.pad_token_id] * (self.max_length - len(encoded))
+                    # Do not pad or truncate here; return actual sequence length
                     yield torch.tensor(encoded, dtype=torch.long)
                 buffer = []
         
@@ -111,18 +134,29 @@ class SELFIESDataset(IterableDataset):
             random.shuffle(buffer)
             for selfies_string in buffer:
                 encoded = self.tokenizer.encode(selfies_string, add_special_tokens=True)
-                if len(encoded) > self.max_length:
-                    encoded = encoded[:self.max_length]
-                else:
-                    encoded += [self.tokenizer.pad_token_id] * (self.max_length - len(encoded))
+                # Do not pad or truncate here; return actual sequence length
                 yield torch.tensor(encoded, dtype=torch.long)
 
 
 def collate_fn(batch, pad_token_id=0):
     """
-    Collate function to create input_ids and attention_mask.
+    Dynamic padding to actual sequence lengths in the batch.
     """
-    input_ids = torch.stack(batch)
+    # Find max length in this batch
+    max_len = max(len(seq) for seq in batch)
+    
+    padded_batch = []
+    for seq in batch:
+        if len(seq) < max_len:
+            padded = torch.cat([
+                seq,
+                torch.full((max_len - len(seq),), pad_token_id, dtype=torch.long)
+            ])
+        else:
+            padded = seq[:max_len]
+        padded_batch.append(padded)
+    
+    input_ids = torch.stack(padded_batch)
     attention_mask = (input_ids != pad_token_id).long()
     return {'input_ids': input_ids, 'attention_mask': attention_mask} 
 
@@ -165,3 +199,7 @@ class FixedSizeSELFIESDataset(Dataset):
             encoded += [self.tokenizer.pad_token_id] * (self.max_length - len(encoded))
         
         return torch.tensor(encoded, dtype=torch.long) 
+
+    def set_max_length(self, new_max_length: int) -> None:
+        """Update maximum sequence length used for truncation/padding."""
+        self.max_length = int(new_max_length)

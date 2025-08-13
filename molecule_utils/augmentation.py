@@ -1,8 +1,9 @@
 """
-Robust molecular augmentation for SELFIES contrastive learning.
+Molecular augmentation utilities for SELFIES.
 
-This module implements chemically-aware augmentation strategies that respect
-SELFIES structure and ensure molecular validity through proper validation.
+This module provides SMILES enumeration-based augmentation that can be used
+for data augmentation during training. The augmentations preserve molecular
+validity by using RDKit's SMILES randomization.
 """
 
 import random
@@ -109,59 +110,30 @@ class SELFIESAugmenter:
                                   canonical=False,
                                   allBondsExplicit=random.choice([True, False]))
 
-    def augment_batch(self, selfies_list: List[str], n_augmentations: int = 10, 
-                     return_mapping: bool = True) -> tuple:
+    def augment_batch(self, selfies_list: List[str], n_augmentations: int = 10) -> List[str]:
         """
-        Augment a batch of SELFIES strings for contrastive learning.
+        Augment a batch of SELFIES strings.
+        
+        This can be used for data augmentation during training to increase
+        the diversity of training examples.
         
         Args:
             selfies_list: List of SELFIES strings
             n_augmentations: Number of augmentations per molecule
-            return_mapping: Whether to return mapping to original indices
             
         Returns:
-            Tuple of (augmented_selfies, labels) if return_mapping=True
-            List of augmented_selfies otherwise
+            List of augmented SELFIES strings
         """
         augmented_batch = []
-        labels = []
         
-        for idx, selfies in enumerate(selfies_list):
+        for selfies in selfies_list:
             augmentations = self.augment(selfies, n_augmentations)
             augmented_batch.extend(augmentations)
-            
-            if return_mapping:
-                labels.extend([idx] * len(augmentations))
         
-        if return_mapping:
-            return augmented_batch, labels
         return augmented_batch
 
-
-def create_contrastive_batch(
-    selfies_batch: List[str], 
-    augmenter: SELFIESAugmenter,
-    n_augmentations: int = 10
-) -> Tuple[List[str], List[int]]:
-    """
-    Create contrastive learning batch with SMILES enumeration augmentations.
-    """
-    augmented_strings = []
-    labels = []
-    
-    for idx, selfies_string in enumerate(selfies_batch):
-        # Get SMILES enumeration augmentations
-        augmentations = augmenter.augment(selfies_string, n_augmentations)
-        
-        # Add to batch
-        augmented_strings.extend(augmentations)
-        labels.extend([idx] * len(augmentations))
-        
-        # Less frequent cleanup for large batches only
-        if len(selfies_batch) > 1000 and idx % 200 == 0 and idx > 0:
-            gc.collect()
-    
-    return augmented_strings, labels
+# Note: Removed create_contrastive_batch function as it's no longer needed
+# for the pure autoregressive model
 
 
  
