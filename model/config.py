@@ -3,7 +3,7 @@ import dataclasses
 @dataclasses.dataclass
 class ModelConfig:
     """
-    Configuration for the SELFIES GPT-style decoder model.
+    Configuration for the SMILES GPT-style decoder model.
     """
     # Core model architecture
     vocab_size: int = 512
@@ -27,7 +27,7 @@ class ModelConfig:
     use_cache: bool = True              # Key-value caching
     tie_word_embeddings: bool = False   # Tie input/output embeddings
     
-    # SELFIES-specific features (deprecated; SELFIES ensures validity)
+    # SMILES-specific features (grammar constraints optional for SMILES)
     use_grammar_constraint: bool = False
     branch_depth_embedding_dim: int = 64
     max_branch_depth: int = 16
@@ -54,9 +54,9 @@ class ModelConfig:
         if self.d_ff is None:
             self.d_ff = 4 * self.d_model
 
-        # Soft-deprecate grammar/chemistry constraints
+        # Grammar/chemistry constraints note for SMILES
         if self.use_grammar_constraint:
-            print("Warning: use_grammar_constraint is deprecated and will be ignored. SELFIES already enforces validity.")
+            print("Warning: use_grammar_constraint not yet implemented for SMILES generation.")
 
     @classmethod
     def from_dict(cls, config_dict):

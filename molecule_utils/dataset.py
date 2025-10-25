@@ -5,14 +5,14 @@ import pandas as pd
 import math
 import random
 
-from .tokenizer import SELFIESTokenizer
+from .tokenizer import SMILESTokenizer
 
 def count_lines(file_path: str) -> int:
-    """Counts the number of lines in a file, skipping the header."""
+    """Counts the number of lines in a file."""
     try:
         with open(file_path, 'r') as f:
             # Efficiently count lines without loading the file into memory
-            return sum(1 for _ in f) - 1 # Subtract 1 for header
+            return sum(1 for _ in f)
     except FileNotFoundError:
         return 0
 
@@ -38,16 +38,16 @@ def get_curriculum_max_length(epoch: int,
     progress = clamped_epoch / float(total_epochs)
     return int(min_len + (max_len - min_len) * progress)
 
-class SELFIESDataset(IterableDataset):
+class SMILESDataset(IterableDataset):
     """
-    An iterable dataset for reading a large CSV file of SELFIES strings
+    An iterable dataset for reading a large CSV file of SMILES strings
     without loading the entire file into memory. It can serve a train or
     validation split from the same file and shuffles data in a streaming manner.
     """
     def __init__(
         self, 
         file_path: str, 
-        tokenizer: SELFIESTokenizer, 
+        tokenizer: SMILESTokenizer, 
         max_length: int,
         total_lines: int,
         split: str = 'train',
@@ -64,11 +64,11 @@ class SELFIESDataset(IterableDataset):
         
         # Calculate the start and end line for this split
         if split == 'train':
-            self.start_line = 1 # Skip header
+            self.start_line = 0
             self.end_line = math.floor(total_lines * split_ratio)
         elif split == 'val':
-            self.start_line = math.floor(total_lines * split_ratio) + 1
-            self.end_line = total_lines + 1
+            self.start_line = math.floor(total_lines * split_ratio)
+            self.end_line = total_lines
         else:
             raise ValueError("split must be 'train' or 'val'")
         
@@ -93,10 +93,10 @@ class SELFIESDataset(IterableDataset):
 
             chunk_iterator = pd.read_csv(
                 self.file_path,
-                usecols=['SELFIES'],
+                usecols=[0],
                 chunksize=10000,
-                header=0,
-                skiprows=range(1, self.start_line),
+                header=None,
+                skiprows=range(0, self.start_line) if self.start_line > 0 else None,
                 nrows=num_rows_to_read,
                 on_bad_lines='skip'
             )
@@ -104,7 +104,7 @@ class SELFIESDataset(IterableDataset):
             line_idx = -1
             # The `nrows` argument correctly constrains the reader to the intended split.
             for chunk in chunk_iterator:
-                for selfies_string in chunk['SELFIES']:
+                for smiles_string in chunk[0]:
                     line_idx += 1
 
                     # If in a worker process, skip lines not assigned to this worker.
@@ -112,8 +112,8 @@ class SELFIESDataset(IterableDataset):
                         if line_idx % worker_info.num_workers != worker_info.id:
                             continue
                     
-                    if isinstance(selfies_string, str):
-                        yield selfies_string
+                    if isinstance(smiles_string, str):
+                        yield smiles_string
         except FileNotFoundError:
             return
 
@@ -123,8 +123,8 @@ class SELFIESDataset(IterableDataset):
             buffer.append(line)
             if len(buffer) >= self.shuffle_buffer_size:
                 random.shuffle(buffer)
-                for selfies_string in buffer:
-                    encoded = self.tokenizer.encode(selfies_string, add_special_tokens=True)
+                for smiles_string in buffer:
+                    encoded = self.tokenizer.encode(smiles_string, add_special_tokens=True)
                     # Do not pad or truncate here; return actual sequence length
                     yield torch.tensor(encoded, dtype=torch.long)
                 buffer = []
@@ -132,8 +132,8 @@ class SELFIESDataset(IterableDataset):
         # Yield remaining items
         if buffer:
             random.shuffle(buffer)
-            for selfies_string in buffer:
-                encoded = self.tokenizer.encode(selfies_string, add_special_tokens=True)
+            for smiles_string in buffer:
+                encoded = self.tokenizer.encode(smiles_string, add_special_tokens=True)
                 # Do not pad or truncate here; return actual sequence length
                 yield torch.tensor(encoded, dtype=torch.long)
 
@@ -160,27 +160,27 @@ def collate_fn(batch, pad_token_id=0):
     attention_mask = (input_ids != pad_token_id).long()
     return {'input_ids': input_ids, 'attention_mask': attention_mask} 
 
-class FixedSizeSELFIESDataset(Dataset):
+class FixedSizeSMILESDataset(Dataset):
     """
     A map-style dataset for a fixed-size validation set.
     Reads a portion of the CSV file into memory.
     """
-    def __init__(self, file_path: str, tokenizer: SELFIESTokenizer, max_length: int, num_samples: int, total_lines: int):
+    def __init__(self, file_path: str, tokenizer: SMILESTokenizer, max_length: int, num_samples: int, total_lines: int):
         self.tokenizer = tokenizer
         self.max_length = max_length
         
         try:
-            # Read the last `num_samples` from the file, skipping the header and the training part
-            skip_rows = max(1, total_lines - num_samples)
+            # Read the last `num_samples` from the file
+            skip_rows = max(0, total_lines - num_samples)
             df = pd.read_csv(
                 file_path,
-                usecols=['SELFIES'],
-                skiprows=range(1, skip_rows),
+                usecols=[0],
+                skiprows=range(0, skip_rows) if skip_rows > 0 else None,
                 nrows=num_samples,
-                header=0,
+                header=None,
                 on_bad_lines='skip'
             )
-            self.data = df['SELFIES'].dropna().tolist()
+            self.data = df[0].dropna().tolist()
         except FileNotFoundError:
             print(f"Warning: Data file not found at {file_path}. The dataset will be empty.")
             self.data = []
@@ -189,8 +189,8 @@ class FixedSizeSELFIESDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        selfies_string = self.data[idx]
-        encoded = self.tokenizer.encode(selfies_string, add_special_tokens=True)
+        smiles_string = self.data[idx]
+        encoded = self.tokenizer.encode(smiles_string, add_special_tokens=True)
         
         # Pad or truncate
         if len(encoded) > self.max_length:

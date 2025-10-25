@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diagnostic script to test if the SELFIES GPT model can overfit on a single batch.
+Diagnostic script to test if the SMILES GPT model can overfit on a single batch.
 This helps identify fundamental issues with the model architecture or data pipeline.
 """
 
@@ -14,16 +14,16 @@ import sys
 sys.path.append(str(Path(__file__).parent.parent))
 
 from model.config import ModelConfig
-from model.decoder import SELFIESGPTDecoder
-from molecule_utils.tokenizer import SELFIESTokenizer
-from molecule_utils.dataset import SELFIESDataset, collate_fn
+from model.decoder import SMILESGPTDecoder
+from molecule_utils.tokenizer import SMILESTokenizer
+from molecule_utils.dataset import SMILESDataset, collate_fn
 from torch.utils.data import DataLoader
 
 
 def load_model_and_tokenizer(checkpoint_path, vocab_path, device):
     """Load model from checkpoint and tokenizer."""
     print(f"Loading tokenizer from {vocab_path}")
-    tokenizer = SELFIESTokenizer(vocab_path=vocab_path)
+    tokenizer = SMILESTokenizer(vocab_path=vocab_path)
     
     print(f"Loading model from {checkpoint_path}")
     
@@ -32,7 +32,7 @@ def load_model_and_tokenizer(checkpoint_path, vocab_path, device):
     config.vocab_size = tokenizer.vocab_size
     
     # Initialize model
-    model = SELFIESGPTDecoder(config).to(device)
+    model = SMILESGPTDecoder(config).to(device)
     
     # Load checkpoint
     checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -89,7 +89,7 @@ def run_overfit_test(model, tokenizer, data_path, device,
     
     print("\n=== Setting up data loader ===")
     # Create minimal dataset
-    dataset = SELFIESDataset(
+    dataset = SMILESDataset(
         file_path=data_path,
         tokenizer=tokenizer,
         max_length=max_seq_len,
@@ -211,7 +211,7 @@ def run_overfit_test(model, tokenizer, data_path, device,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Test if SELFIES GPT model can overfit on single batch"
+        description="Test if SMILES GPT model can overfit on single batch"
     )
     
     parser.add_argument(
@@ -225,7 +225,7 @@ def main():
         "--data_path",
         type=str,
         required=True,
-        help="Path to SELFIES CSV file"
+        help="Path to SMILES CSV file"
     )
     
     parser.add_argument(

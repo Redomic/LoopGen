@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Training script for autoregressive SELFIES GPT decoder.
+Training script for autoregressive SMILES GPT decoder.
 
 This trains a pure generative model using reconstruction loss to learn
-molecular SELFIES generation. Future versions will add protein conditioning.
+molecular SMILES generation. Future versions will add protein conditioning.
 """
 import argparse
 import json
@@ -25,9 +25,9 @@ import pandas as pd
 import numpy as np
 
 from model.config import ModelConfig
-from model.decoder import SELFIESGPTDecoder
-from molecule_utils.tokenizer import SELFIESTokenizer
-from molecule_utils.dataset import SELFIESDataset, collate_fn, count_lines
+from model.decoder import SMILESGPTDecoder
+from molecule_utils.tokenizer import SMILESTokenizer
+from molecule_utils.dataset import SMILESDataset, collate_fn, count_lines
 
 # region: Logging and Directory Setup
 # ==============================================================================
@@ -53,7 +53,7 @@ def setup_run_directory(base_output_dir: str) -> Path:
     logging.info(f"Started new training run in {run_dir}")
     return run_dir
 
-def save_run_config(args: argparse.Namespace, run_dir: Path, tokenizer: SELFIESTokenizer):
+def save_run_config(args: argparse.Namespace, run_dir: Path, tokenizer: SMILESTokenizer):
     """Save the configuration for this training run."""
     config_dict = vars(args).copy()
     config_dict['vocab_size'] = tokenizer.vocab_size
@@ -94,17 +94,17 @@ def save_training_metrics(run_dir: Path, epoch: int, train_metrics: Dict, val_me
 # region: Core Training Functions
 # ==============================================================================
 
-def analyze_sequence_lengths(data_path: str, tokenizer: SELFIESTokenizer, n_samples: int = 10000):
+def analyze_sequence_lengths(data_path: str, tokenizer: SMILESTokenizer, n_samples: int = 10000):
     """Analyze actual sequence lengths in the dataset."""
     lengths = []
-    for chunk in pd.read_csv(data_path, usecols=['SELFIES'], chunksize=1000):
+    for chunk in pd.read_csv(data_path, usecols=[0], header=None, chunksize=1000):
         # Respect n_samples cap
         if len(lengths) >= n_samples:
             break
         take = max(0, n_samples - len(lengths))
-        for selfies in chunk['SELFIES'][:take]:
-            if isinstance(selfies, str):
-                tokens = tokenizer.encode(selfies, add_special_tokens=True)
+        for smiles in chunk[0][:take]:
+            if isinstance(smiles, str):
+                tokens = tokenizer.encode(smiles, add_special_tokens=True)
                 lengths.append(len(tokens))
     if not lengths:
         print("No sequences found for length analysis.")
@@ -116,7 +116,7 @@ def analyze_sequence_lengths(data_path: str, tokenizer: SELFIESTokenizer, n_samp
     print(f"  Std: {np.std(lengths):.1f}")
     print(f"  95th percentile: {np.percentile(lengths, 95):.1f}")
 
-def _autoregressive_collate_fn(batch: List[torch.Tensor], tokenizer: SELFIESTokenizer, max_seq_len: int = 256) -> Dict[str, torch.Tensor]:
+def _autoregressive_collate_fn(batch: List[torch.Tensor], tokenizer: SMILESTokenizer, max_seq_len: int = 256) -> Dict[str, torch.Tensor]:
     """Dynamic padding collate function with optional cap."""
     # Find the maximum length in this specific batch
     max_len = min(max(len(t) for t in batch), max_seq_len)
@@ -140,7 +140,7 @@ def _autoregressive_collate_fn(batch: List[torch.Tensor], tokenizer: SELFIESToke
         'attention_mask': attention_mask
     }
 
-def _train_epoch(model: SELFIESGPTDecoder, loader: DataLoader, optimizer: torch.optim.Optimizer, scaler: GradScaler, device: torch.device, args: argparse.Namespace) -> Dict[str, float]:
+def _train_epoch(model: SMILESGPTDecoder, loader: DataLoader, optimizer: torch.optim.Optimizer, scaler: GradScaler, device: torch.device, args: argparse.Namespace) -> Dict[str, float]:
     """Train one epoch with autoregressive reconstruction loss."""
     model.train()
     total_loss = 0.0
@@ -199,7 +199,7 @@ def _train_epoch(model: SELFIESGPTDecoder, loader: DataLoader, optimizer: torch.
         'entropy': total_entropy / num_batches
     }
 
-def _validate(model: SELFIESGPTDecoder, loader: DataLoader, device: torch.device, args: argparse.Namespace) -> Dict[str, float]:
+def _validate(model: SMILESGPTDecoder, loader: DataLoader, device: torch.device, args: argparse.Namespace) -> Dict[str, float]:
     """Validate model with reconstruction loss."""
     model.eval()
     total_loss = 0.0
@@ -234,7 +234,7 @@ def _validate(model: SELFIESGPTDecoder, loader: DataLoader, device: torch.device
         'entropy': total_entropy / num_batches
     }
 
-def generate_molecules(model: SELFIESGPTDecoder, tokenizer: SELFIESTokenizer, device: torch.device, args) -> List[str]:
+def generate_molecules(model: SMILESGPTDecoder, tokenizer: SMILESTokenizer, device: torch.device, args) -> List[str]:
     """Generate molecules using the model's built-in generation method."""
     model.eval()
     
@@ -249,11 +249,11 @@ def generate_molecules(model: SELFIESGPTDecoder, tokenizer: SELFIESTokenizer, de
         num_return_sequences=args.num_generated
     )
     
-    # Decode to SELFIES strings
+    # Decode to SMILES strings
     generated_molecules = []
     for seq_ids in generated_ids:
-        selfies_str = tokenizer.decode(seq_ids.tolist(), skip_special_tokens=True)
-        generated_molecules.append(selfies_str)
+        smiles_str = tokenizer.decode(seq_ids.tolist(), skip_special_tokens=True)
+        generated_molecules.append(smiles_str)
     
     return generated_molecules
 
@@ -339,12 +339,12 @@ def analyze_dataset(dataset, name="Dataset"):
         print(f"  Average Jaccard similarity: {sum(similarities)/len(similarities):.3f}")
 
 def train(args, tokenizer, device):
-    """Main training loop for autoregressive SELFIES generation."""
+    """Main training loop for autoregressive SMILES generation."""
     # Setup run directory and logging
     run_dir = setup_run_directory(args.output_dir)
     save_run_config(args, run_dir, tokenizer)
     
-    logging.info("Starting Autoregressive SELFIES Training")
+    logging.info("Starting Autoregressive SMILES Training")
     
     # Config
     if args.model_size == "small": config = ModelConfig.small_config()
@@ -361,8 +361,8 @@ def train(args, tokenizer, device):
     train_split_ratio = train_size / total_lines if total_lines > 0 else 0.0
     logging.info(f"Dataset size: {total_lines} (Train: {train_size}, Val: {val_size})")
 
-    train_dataset = SELFIESDataset(args.data_path, tokenizer, config.max_seq_len, total_lines=total_lines, split='train', split_ratio=train_split_ratio)
-    val_dataset = SELFIESDataset(args.data_path, tokenizer, config.max_seq_len, total_lines=total_lines, split='val', split_ratio=train_split_ratio)
+    train_dataset = SMILESDataset(args.data_path, tokenizer, config.max_seq_len, total_lines=total_lines, split='train', split_ratio=train_split_ratio)
+    val_dataset = SMILESDataset(args.data_path, tokenizer, config.max_seq_len, total_lines=total_lines, split='val', split_ratio=train_split_ratio)
     
     # Debug dataset diversity
     analyze_dataset(train_dataset, "Train")
@@ -376,7 +376,7 @@ def train(args, tokenizer, device):
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_fn)
     
     # Model, optimizer, scaler
-    model = SELFIESGPTDecoder(config).to(device)
+    model = SMILESGPTDecoder(config).to(device)
     
     # Set tokenizer for special tokens
     model.set_tokenizer(tokenizer)
@@ -470,7 +470,7 @@ def train(args, tokenizer, device):
 
 def main():
     """Main entry point for training."""
-    parser = argparse.ArgumentParser(description="Autoregressive Training for SELFIES GPT Decoder")
+    parser = argparse.ArgumentParser(description="Autoregressive Training for SMILES GPT Decoder")
 
     # Core arguments
     parser.add_argument("--data_path", type=str, required=True, help="Path to training SMILES file")
@@ -531,12 +531,12 @@ def main():
 
     if not vocab_path.exists():
         print(f"Building vocabulary from {args.data_path}...")
-        tokenizer = SELFIESTokenizer(data_path=args.data_path)
+        tokenizer = SMILESTokenizer(data_path=args.data_path)
         tokenizer.save_vocabulary(str(vocab_path))
         print(f"Vocabulary saved to {vocab_path}")
     else:
         print(f"Loading vocabulary from {vocab_path}")
-        tokenizer = SELFIESTokenizer(vocab_path=str(vocab_path))
+        tokenizer = SMILESTokenizer(vocab_path=str(vocab_path))
     
     print(f"Vocabulary size: {tokenizer.vocab_size}")
 

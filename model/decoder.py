@@ -438,12 +438,12 @@ class DecoderBlock(nn.Module):
         x = x + self.drop_path(self.mlp(self.ln_2(x)), self.drop_path_prob)
         return x
 
-class SELFIESGPTDecoder(nn.Module):
+class SMILESGPTDecoder(nn.Module):
     """
-    Autoregressive GPT-style decoder model for SELFIES molecular generation.
+    Autoregressive GPT-style decoder model for SMILES molecular generation.
     
     This model learns to generate molecules by:
-    1. Reconstruction loss - Learning to speak "molecular SELFIES"
+    1. Reconstruction loss - Learning to speak "molecular SMILES"
     2. (Future) Protein conditioning - Learning to listen to "protein language"
     
     The model is purely generative without contrastive learning components.
@@ -481,9 +481,9 @@ class SELFIESGPTDecoder(nn.Module):
         # TODO: Add protein encoder module here for conditioning
         # self.protein_encoder = ProteinEncoder(config) if config.use_protein_conditioning else None
 
-        # Deprecated: grammar/chemistry constraints
+        # Note: Grammar/chemistry constraints could be added for SMILES validation
         if hasattr(config, 'use_grammar_constraint') and config.use_grammar_constraint:
-            print("Warning: Grammar/Chemistry constraints are deprecated and disabled. SELFIES ensures validity; set use_grammar_constraint=False.")
+            print("Warning: Grammar/Chemistry constraints not yet implemented for SMILES; set use_grammar_constraint=False.")
         
         # Label smoothing for reconstruction loss
         self.label_smoothing = 0.1
@@ -579,7 +579,7 @@ class SELFIESGPTDecoder(nn.Module):
         Compute autoregressive reconstruction loss for molecular generation.
         
         This is the core training objective: learning to predict the next token
-        in a SELFIES sequence, optionally conditioned on protein context.
+        in a SMILES sequence, optionally conditioned on protein context.
         
         Args:
             input_ids: Token IDs [batch_size, seq_len]
@@ -751,7 +751,7 @@ class SELFIESGPTDecoder(nn.Module):
                 top_p: float = 0.95,
                 num_return_sequences: int = 1) -> torch.Tensor:
         """
-        Generate molecular SELFIES sequences autoregressively.
+        Generate molecular SMILES sequences autoregressively.
         
         Args:
             prompt_ids: Optional prompt tokens [batch_size, prompt_len]
@@ -778,6 +778,7 @@ class SELFIESGPTDecoder(nn.Module):
                 protein_embeddings = protein_embeddings.repeat(num_return_sequences, 1)
         
         generated = prompt_ids
+        finished = torch.zeros(num_return_sequences, dtype=torch.bool, device=device)
         
         for _ in range(max_length - prompt_ids.size(1)):
             # Get logits for next token
@@ -791,15 +792,21 @@ class SELFIESGPTDecoder(nn.Module):
             probs = F.softmax(filtered_logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
             
+            # Check for EOS and mark finished sequences
+            finished = finished | (next_token.squeeze(-1) == self.eos_token_id)
+            
+            # Replace next_token with PAD for finished sequences
+            next_token[finished] = self.pad_token_id
+            
             # Append to generated sequence
             generated = torch.cat([generated, next_token], dim=1)
             
             # Stop if all sequences have generated EOS
-            if (next_token == self.eos_token_id).all():
+            if finished.all():
                 break
         
         return generated
-    
+
     def _top_k_top_p_filtering(self, logits, top_k=50, top_p=0.95):
         """Apply top-k and nucleus (top-p) filtering to logits."""
         # Top-k filtering

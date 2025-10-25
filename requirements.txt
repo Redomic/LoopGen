@@ -1,11 +1,13 @@
 torch
 pandas
 pyarrow
-selfies
+rdkit
+SmilesPE
 numpy
 tqdm
 # For development and linting
 pylint
 black
 flake8
-mypy 
+mypy
+awscli
