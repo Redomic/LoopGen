@@ -32,13 +32,13 @@ STRUCTURES_FILE="CrossDocked2020_v1.3.tgz"
 TYPES_FILE="CrossDocked2020_v1.3_types.tgz"
 
 # Default Parameters
-OUTPUT_CSV="protein_ligand_pairs.csv"
+OUTPUT_CSV="protein_ligand_training.csv"
 DATA_DIR="data"
 CLEANUP=false
 RESUME=true
 DEBUG_MODE=false
 WORKERS=$(nproc --all 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
-EXTRACT_TYPES=true
+MAX_PAIRS=10000  # Default to 10K pairs for initial testing
 
 # --- UI Colors ---
 RED='\033[0;31m'
@@ -94,7 +94,7 @@ ${GREEN}Basic Options:${NC}
 
 ${GREEN}Processing Options:${NC}
   --workers NUM            Number of parallel workers for processing (default: $WORKERS)
-  --no-extract-types       Skip extracting and processing types file
+  --max-pairs NUM          Maximum number of pairs to process (default: $MAX_PAIRS, 0=all)
   
 ${GREEN}Advanced & Process Control:${NC}
   -r, --resume             Resume previous job (default: enabled)
@@ -106,9 +106,9 @@ ${GREEN}Advanced & Process Control:${NC}
   -h, --help               Show this help message
 
 ${YELLOW}Examples:${NC}
-  $0                                # Download and process CrossDock2020 dataset
-  $0 -o my_pairs.csv                # Custom output filename
-  $0 --no-extract-types             # Skip types file processing
+  $0                                # Download and process CrossDock2020 dataset (10K pairs)
+  $0 --max-pairs 100000             # Process 100K pairs
+  $0 --max-pairs 0                  # Process ALL pairs (~100K+)
   $0 -s                             # Check current job status
   $0 -k                             # Stop the running job
 EOF
@@ -214,12 +214,12 @@ save_state() {
     jq -n \
         --arg output "$OUTPUT_CSV" \
         --arg data_dir "$DATA_DIR" \
-        --arg extract_types "$EXTRACT_TYPES" \
+        --arg max_pairs "$MAX_PAIRS" \
         --arg pid "$pid" \
         --arg start_time "$START_TIME" \
         --arg status "running" \
         --arg workers "$WORKERS" \
-        '{output: $output, data_dir: $data_dir, extract_types: $extract_types, pid: $pid, start_time: $start_time, status: $status, workers: $workers}' \
+        '{output: $output, data_dir: $data_dir, max_pairs: $max_pairs, pid: $pid, start_time: $start_time, status: $status, workers: $workers}' \
         > "$STATE_FILE"
 }
 
@@ -302,36 +302,19 @@ download_crossdock_files() {
         return 1
     fi
     
-    # Extract structures archive to crossdocked folder
-    local extract_dir="$cache_dir/crossdocked"
-    mkdir -p "$extract_dir"
-    log_info "Extracting structures archive to $extract_dir (this may take a while)..."
-    if tar -xzf "$cache_dir/$STRUCTURES_FILE" -C "$extract_dir"; then
-        log_success "Structures archive extracted successfully to crossdocked/"
+    # Download types archive (contains affinity data)
+    log_info "Downloading types archive (contains binding affinity data)..."
+    if ! download_file_with_aria2c "$CROSSDOCK_BASE_URL/$TYPES_FILE" "$TYPES_FILE" "$cache_dir"; then
+        log_error "Failed to download types archive"
+        log_warn "Affinities will not be available without types file"
     else
-        log_error "Failed to extract structures archive"
-        return 1
+        log_success "Types archive downloaded successfully"
     fi
     
-    # Download types file if requested
-    if [ "$EXTRACT_TYPES" = true ]; then
-        if ! download_file_with_aria2c "$CROSSDOCK_BASE_URL/$TYPES_FILE" "$TYPES_FILE" "$cache_dir"; then
-            log_error "Failed to download types file"
-            return 1
-        fi
-        
-        # Extract types file
-        log_info "Extracting types file..."
-        mkdir -p "$cache_dir/types"
-        if tar -xzf "$cache_dir/$TYPES_FILE" -C "$cache_dir/types"; then
-            log_success "Types file extracted successfully"
-        else
-            log_error "Failed to extract types file"
-            return 1
-        fi
-    fi
-    
-    log_success "All CrossDock2020 files downloaded and extracted successfully"
+    # Don't extract structures - we'll read directly from archive
+    log_success "CrossDock2020 archives ready"
+    log_info "Processing will read directly from archives (no full extraction needed)"
+    log_info "This saves disk space and avoids inode issues"
     return 0
 }
 
@@ -401,10 +384,10 @@ start_pipeline() {
     echo "--------------------------------------------------"
     log_info "Output CSV file: $OUTPUT_CSV"
     log_info "Workers: $WORKERS"
-    log_info "Extract types file: $EXTRACT_TYPES"
+    log_info "Max pairs to process: $MAX_PAIRS"
     
     local data_cache_dir="$DATA_DIR/crossdocked"
-    check_disk_space "$data_cache_dir" 10  # CrossDock2020 is smaller than PubChem
+    check_disk_space "$data_cache_dir" 10
     
     # Download files
     if ! download_crossdock_files "$data_cache_dir"; then
@@ -418,10 +401,11 @@ start_pipeline() {
         --output "$OUTPUT_CSV"
         --data-dir "$DATA_DIR"
         --workers "$WORKERS"
-        --debug  # Enable debug mode by default for troubleshooting
+        --max-pairs "$MAX_PAIRS"
+        --no-affinity
     )
     [ "$CLEANUP" = true ] && python_cmd+=(--cleanup)
-    [ "$EXTRACT_TYPES" = false ] && python_cmd+=(--no-extract-types)
+    [ "$DEBUG_MODE" = true ] && python_cmd+=(--debug)
     
     # Execute Python pipeline in the background and monitor it
     "${python_cmd[@]}" 2>&1 | tee -a "$PROGRESS_LOG" &
@@ -538,10 +522,10 @@ main() {
             -o|--output) OUTPUT_CSV="$2"; shift 2 ;;
             -d|--data-dir) DATA_DIR="$2"; shift 2 ;;
             --workers) WORKERS="$2"; shift 2 ;;
+            --max-pairs) MAX_PAIRS="$2"; shift 2 ;;
             -r|--resume) RESUME=true; shift ;;
             -R|--no-resume) RESUME=false; shift ;;
             -C|--cleanup) CLEANUP=true; shift ;;
-            --no-extract-types) EXTRACT_TYPES=false; shift ;;
             -s|--status) show_status; exit 0 ;;
             -k|--kill) kill_pipeline; exit 0 ;;
             --debug) DEBUG_MODE=true; shift ;;

@@ -35,7 +35,7 @@ def load_model_and_tokenizer(checkpoint_path, vocab_path, device):
     model = SMILESGPTDecoder(config).to(device)
     
     # Load checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
         model.load_state_dict(checkpoint['model_state_dict'])
     else:

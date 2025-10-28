@@ -407,6 +407,66 @@ class FeedForward(nn.Module):
         x = self.dropout(x)
         return x
 
+class CrossAttentionLayer(nn.Module):
+    """
+    Cross-attention from molecule hidden states to protein features.
+    
+    Allows the molecule decoder to attend to protein pocket embeddings,
+    enabling protein-conditioned generation.
+    """
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=config.d_model,
+            num_heads=config.n_heads,
+            dropout=config.attention_dropout,
+            batch_first=True
+        )
+        self.layer_norm = nn.LayerNorm(config.d_model, eps=config.layer_norm_eps)
+        self.dropout = nn.Dropout(config.dropout)
+    
+    def forward(
+        self, 
+        hidden_states: torch.Tensor, 
+        protein_embeddings: torch.Tensor, 
+        protein_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Apply cross-attention from molecule to protein.
+        
+        Args:
+            hidden_states: Molecule hidden states [batch, mol_seq_len, d_model] (query)
+            protein_embeddings: Protein embeddings [batch, prot_seq_len, d_model] (key/value)
+            protein_mask: Protein attention mask [batch, prot_seq_len] (1=real, 0=pad)
+        
+        Returns:
+            Cross-attended hidden states [batch, mol_seq_len, d_model]
+        """
+        # Normalize before attention (pre-norm)
+        normed_hidden = self.layer_norm(hidden_states)
+        
+        # Create key padding mask for cross-attention
+        # MultiheadAttention expects: True for positions to ignore (padding)
+        if protein_mask is not None:
+            key_padding_mask = (protein_mask == 0)
+        else:
+            key_padding_mask = None
+        
+        # Cross-attention: query from molecule, key/value from protein
+        attn_output, _ = self.cross_attn(
+            query=normed_hidden,
+            key=protein_embeddings,
+            value=protein_embeddings,
+            key_padding_mask=key_padding_mask,
+            need_weights=False
+        )
+        
+        # Apply dropout
+        attn_output = self.dropout(attn_output)
+        
+        return attn_output
+
+
 class DecoderBlock(nn.Module):
     """ A single Transformer Decoder block with Pre-Layer Normalization and Stochastic Depth. """
     def __init__(self, config: ModelConfig, layer_idx: int):
@@ -415,6 +475,20 @@ class DecoderBlock(nn.Module):
         self.attn = Attention(config)
         self.ln_2 = nn.LayerNorm(config.d_model, eps=config.layer_norm_eps)
         self.mlp = FeedForward(config)
+        
+        # Cross-attention to protein (if protein conditioning enabled)
+        if hasattr(config, 'use_protein_conditioning') and config.use_protein_conditioning:
+            if hasattr(config, 'use_cross_attention') and config.use_cross_attention:
+                # Apply cross-attention every N layers
+                cross_attn_freq = getattr(config, 'cross_attention_freq', 1)
+                if layer_idx % cross_attn_freq == 0:
+                    self.cross_attn = CrossAttentionLayer(config)
+                else:
+                    self.cross_attn = None
+            else:
+                self.cross_attn = None
+        else:
+            self.cross_attn = None
         
         # Stochastic Depth (drop path)
         # Linearly increase drop prob from 0 to the target prob over layers
@@ -431,9 +505,20 @@ class DecoderBlock(nn.Module):
         output = x.div(keep_prob) * random_tensor
         return output
 
-    def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # Pre-LN: Norm -> Attention -> Add, with drop path
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        attention_mask: Optional[torch.Tensor] = None,
+        protein_embeddings: Optional[torch.Tensor] = None,
+        protein_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        # Pre-LN: Norm -> Self-Attention -> Add, with drop path
         x = x + self.drop_path(self.attn(self.ln_1(x), attention_mask=attention_mask), self.drop_path_prob)
+        
+        # Cross-attention to protein (if available)
+        if self.cross_attn is not None and protein_embeddings is not None:
+            x = x + self.drop_path(self.cross_attn(x, protein_embeddings, protein_mask), self.drop_path_prob)
+        
         # Pre-LN: Norm -> MLP -> Add, with drop path
         x = x + self.drop_path(self.mlp(self.ln_2(x)), self.drop_path_prob)
         return x
@@ -478,8 +563,13 @@ class SMILESGPTDecoder(nn.Module):
         if config.tie_word_embeddings:
             self.lm_head.weight = self.wte.weight
         
-        # TODO: Add protein encoder module here for conditioning
-        # self.protein_encoder = ProteinEncoder(config) if config.use_protein_conditioning else None
+        # Protein encoder for conditioning
+        if hasattr(config, 'use_protein_conditioning') and config.use_protein_conditioning:
+            from .protein_encoder import ProteinEncoder
+            self.protein_encoder = ProteinEncoder(config)
+            print(f"Initialized ProteinEncoder with {config.protein_encoder_layers} layers")
+        else:
+            self.protein_encoder = None
 
         # Note: Grammar/chemistry constraints could be added for SMILES validation
         if hasattr(config, 'use_grammar_constraint') and config.use_grammar_constraint:
@@ -514,7 +604,8 @@ class SMILESGPTDecoder(nn.Module):
         self, 
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        protein_embeddings: Optional[torch.Tensor] = None,  # TODO: For future protein conditioning
+        protein_ids: Optional[torch.Tensor] = None,
+        protein_mask: Optional[torch.Tensor] = None,
         apply_constraints: bool = False
     ) -> Dict[str, torch.Tensor]:
         """
@@ -523,7 +614,8 @@ class SMILESGPTDecoder(nn.Module):
         Args:
             input_ids: Token IDs [batch_size, seq_len]
             attention_mask: Attention mask [batch_size, seq_len]
-            protein_embeddings: Protein conditioning embeddings [batch_size, protein_dim] (future)
+            protein_ids: Protein token IDs [batch_size, protein_seq_len] (optional)
+            protein_mask: Protein attention mask [batch_size, protein_seq_len] (optional)
             apply_constraints: Backward-compat flag (no-op). Grammar/chem constraints are removed.
         
         Returns:
@@ -532,7 +624,12 @@ class SMILESGPTDecoder(nn.Module):
         batch_size, seq_len = input_ids.size()
         device = input_ids.device
         
-        # 1. Get embeddings
+        # 1. Encode protein if provided
+        protein_embeddings = None
+        if self.protein_encoder is not None and protein_ids is not None:
+            protein_embeddings = self.protein_encoder(protein_ids, protein_mask)
+        
+        # 2. Get molecule embeddings
         tok_embeds = self.embed_dropout(self.wte(input_ids))
         pos_ids = torch.arange(0, seq_len, dtype=torch.long, device=device).unsqueeze(0)
         pos_embeds = self.wpe(pos_ids)
@@ -543,18 +640,18 @@ class SMILESGPTDecoder(nn.Module):
         if self.training:
             hidden_states = hidden_states + torch.randn_like(hidden_states) * 0.1
         
-        # TODO: Add protein conditioning here
-        # if protein_embeddings is not None and self.protein_encoder is not None:
-        #     protein_context = self.protein_encoder(protein_embeddings)
-        #     hidden_states = hidden_states + protein_context.unsqueeze(1)  # Broadcast to all positions
-        
         # Apply input layer norm and dropout
         hidden_states = self.input_ln(hidden_states)
         hidden_states = self.drop(hidden_states)
         
-        # 2. Transformer blocks
+        # 3. Transformer blocks with protein cross-attention
         for block in self.h:
-            hidden_states = block(hidden_states, attention_mask=attention_mask)
+            hidden_states = block(
+                hidden_states, 
+                attention_mask=attention_mask,
+                protein_embeddings=protein_embeddings,
+                protein_mask=protein_mask
+            )
         
         hidden_states = self.ln_f(hidden_states)
         
@@ -574,7 +671,8 @@ class SMILESGPTDecoder(nn.Module):
     def compute_loss(self, 
                     input_ids: torch.Tensor,
                     attention_mask: Optional[torch.Tensor] = None,
-                    protein_embeddings: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+                    protein_ids: Optional[torch.Tensor] = None,
+                    protein_mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """
         Compute autoregressive reconstruction loss for molecular generation.
         
@@ -584,13 +682,14 @@ class SMILESGPTDecoder(nn.Module):
         Args:
             input_ids: Token IDs [batch_size, seq_len]
             attention_mask: Attention mask [batch_size, seq_len]
-            protein_embeddings: Protein conditioning (future implementation)
+            protein_ids: Protein token IDs [batch_size, protein_seq_len] (optional)
+            protein_mask: Protein attention mask [batch_size, protein_seq_len] (optional)
         
         Returns:
             Dictionary with loss components
         """
         # Forward pass
-        model_output = self.forward(input_ids, attention_mask, protein_embeddings)
+        model_output = self.forward(input_ids, attention_mask, protein_ids, protein_mask)
         logits = model_output['logits']
         logits = torch.clamp(logits, min=-10, max=10)
         
@@ -744,7 +843,8 @@ class SMILESGPTDecoder(nn.Module):
     @torch.no_grad()
     def generate(self,
                 prompt_ids: Optional[torch.Tensor] = None,
-                protein_embeddings: Optional[torch.Tensor] = None,
+                protein_ids: Optional[torch.Tensor] = None,
+                protein_mask: Optional[torch.Tensor] = None,
                 max_length: int = 256,
                 temperature: float = 1.0,
                 top_k: int = 50,
@@ -755,7 +855,8 @@ class SMILESGPTDecoder(nn.Module):
         
         Args:
             prompt_ids: Optional prompt tokens [batch_size, prompt_len]
-            protein_embeddings: Protein conditioning (future)
+            protein_ids: Protein token IDs [batch_size, protein_seq_len] (optional)
+            protein_mask: Protein attention mask [batch_size, protein_seq_len] (optional)
             max_length: Maximum generation length
             temperature: Sampling temperature
             top_k: Top-k sampling
@@ -774,15 +875,17 @@ class SMILESGPTDecoder(nn.Module):
         # Expand for multiple sequences
         if num_return_sequences > 1:
             prompt_ids = prompt_ids.repeat(num_return_sequences, 1)
-            if protein_embeddings is not None:
-                protein_embeddings = protein_embeddings.repeat(num_return_sequences, 1)
+            if protein_ids is not None:
+                protein_ids = protein_ids.repeat(num_return_sequences, 1)
+            if protein_mask is not None:
+                protein_mask = protein_mask.repeat(num_return_sequences, 1)
         
         generated = prompt_ids
         finished = torch.zeros(num_return_sequences, dtype=torch.bool, device=device)
         
         for _ in range(max_length - prompt_ids.size(1)):
             # Get logits for next token
-            outputs = self.forward(generated, protein_embeddings=protein_embeddings)
+            outputs = self.forward(generated, protein_ids=protein_ids, protein_mask=protein_mask)
             next_token_logits = outputs['logits'][:, -1, :] / temperature
             
             # Apply top-k and top-p filtering

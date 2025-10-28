@@ -45,6 +45,15 @@ class ModelConfig:
     early_exit_threshold: float = 0.95
     use_expert_routing: bool = False
     num_experts: int = 2
+    
+    # Protein conditioning features
+    use_protein_conditioning: bool = False
+    protein_max_seq_len: int = 512  # Pocket sequences typically 50-300 residues
+    protein_encoder_layers: int = 6
+    protein_encoder_heads: int = 8
+    protein_vocab_size: int = 25  # 20 amino acids + 5 special tokens
+    use_cross_attention: bool = True
+    cross_attention_freq: int = 1  # Apply cross-attn every N layers (1 = every layer)
 
     def __post_init__(self):
         """Validate configuration parameters."""
