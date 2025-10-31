@@ -211,9 +211,35 @@ def protein_conditioned_collate_fn(
         if affinities:
             result['affinity'] = torch.stack(affinities)
     
+    # Add topology features if present
+    if 'topology_features' in batch[0]:
+        topology_features = torch.stack([item['topology_features'] for item in batch])
+        result['topology_features'] = topology_features
+    
     return result
 
-def _train_epoch(model: SMILESGPTDecoder, loader: DataLoader, optimizer: torch.optim.Optimizer, scaler: GradScaler, device: torch.device, args: argparse.Namespace) -> Dict[str, float]:
+def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, min_lr_ratio=0.1):
+    """
+    Create a learning rate scheduler with linear warmup and cosine decay.
+    
+    Args:
+        optimizer: PyTorch optimizer
+        num_warmup_steps: Number of warmup steps
+        num_training_steps: Total number of training steps
+        min_lr_ratio: Minimum learning rate as ratio of initial LR
+    """
+    def lr_lambda(current_step):
+        if current_step < num_warmup_steps:
+            # Linear warmup
+            return float(current_step) / float(max(1, num_warmup_steps))
+        # Cosine decay
+        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+        return max(min_lr_ratio, 0.5 * (1.0 + math.cos(math.pi * progress)))
+    
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+def _train_epoch(model: SMILESGPTDecoder, loader: DataLoader, optimizer: torch.optim.Optimizer, scaler: GradScaler, device: torch.device, args: argparse.Namespace, scheduler=None) -> Dict[str, float]:
     """Train one epoch with autoregressive reconstruction loss."""
     model.train()
     total_loss = 0.0
@@ -235,13 +261,19 @@ def _train_epoch(model: SMILESGPTDecoder, loader: DataLoader, optimizer: torch.o
             protein_ids = protein_ids.to(device)
             protein_mask = protein_mask.to(device)
         
+        # Extract topology features if present
+        topology_features = batch.get('topology_features', None)
+        if topology_features is not None:
+            topology_features = topology_features.to(device)
+        
         with autocast(device.type, enabled=args.use_amp):
             # Compute autoregressive loss
             loss_dict = model.compute_loss(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 protein_ids=protein_ids,
-                protein_mask=protein_mask
+                protein_mask=protein_mask,
+                topology_features=topology_features
             )
             
             loss = loss_dict['loss'] / args.grad_accumulation_steps
@@ -255,6 +287,10 @@ def _train_epoch(model: SMILESGPTDecoder, loader: DataLoader, optimizer: torch.o
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
+            
+            # Step scheduler if provided (for step-based schedulers like cosine with warmup)
+            if scheduler is not None:
+                scheduler.step()
         
         # Update metrics
         total_loss += loss_dict['loss'].item()
@@ -301,12 +337,18 @@ def _validate(model: SMILESGPTDecoder, loader: DataLoader, device: torch.device,
                 protein_ids = protein_ids.to(device)
                 protein_mask = protein_mask.to(device)
             
+            # Get topology features if available
+            topology_features = batch.get('topology_features', None)
+            if topology_features is not None:
+                topology_features = topology_features.to(device)
+            
             with autocast(device.type, enabled=args.use_amp):
                 loss_dict = model.compute_loss(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     protein_ids=protein_ids,
-                    protein_mask=protein_mask
+                    protein_mask=protein_mask,
+                    topology_features=topology_features
                 )
             
             total_loss += loss_dict['loss'].item()
@@ -540,16 +582,27 @@ def train_phase1(args, tokenizer, device, run_dir: Path) -> Path:
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scaler = GradScaler(enabled=args.use_amp)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.8, patience=3, threshold=0.01, min_lr=1e-6
+    
+    # Calculate total training steps for cosine schedule
+    steps_per_epoch = len(train_loader) // args.grad_accumulation_steps
+    total_steps = steps_per_epoch * args.phase1_epochs
+    warmup_steps = min(1000, total_steps // 10)  # 10% warmup or 1000 steps max
+    
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer, 
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps,
+        min_lr_ratio=0.1
     )
+    
+    logging.info(f"Phase 1 LR Schedule: {warmup_steps} warmup steps, {total_steps} total steps")
     
     # Training loop
     best_val_loss = float('inf')
     for epoch in range(args.phase1_epochs):
         logging.info(f"[Phase 1] Epoch {epoch + 1}/{args.phase1_epochs}")
         
-        train_metrics = _train_epoch(model, train_loader, optimizer, scaler, device, args)
+        train_metrics = _train_epoch(model, train_loader, optimizer, scaler, device, args, scheduler)
         val_metrics = _validate(model, val_loader, device, args)
         
         current_lr = optimizer.param_groups[0]['lr']
@@ -561,7 +614,7 @@ def train_phase1(args, tokenizer, device, run_dir: Path) -> Path:
                     f"Acc: {val_metrics['accuracy']:.3f}")
         
         save_training_metrics(run_dir, epoch + 1, train_metrics, val_metrics, current_lr, phase="1")
-        scheduler.step(val_metrics['loss'])
+        # Note: scheduler.step() is now called per-batch in _train_epoch
         
         # Save best model
         if val_metrics['loss'] < best_val_loss:
@@ -623,6 +676,11 @@ def train_phase2(args, tokenizer, device, run_dir: Path, phase1_checkpoint: Path
     config.use_cross_attention = True
     config.cross_attention_freq = args.cross_attention_freq
     
+    # Topology encoding
+    config.use_topology_encoding = args.use_topology
+    if args.use_topology:
+        logging.info(f"Topology encoding enabled, loading from: {args.topology_dir}")
+    
     # Protein-ligand dataset (USE ALL DATA)
     from molecule_utils.protein_ligand_dataset import ProteinLigandDataset, count_protein_ligand_pairs
     
@@ -640,7 +698,9 @@ def train_phase2(args, tokenizer, device, run_dir: Path, phase1_checkpoint: Path
         max_protein_len=config.protein_max_seq_len,
         total_lines=total_lines,
         split='train',
-        split_ratio=train_split_ratio
+        split_ratio=train_split_ratio,
+        topology_dir=args.topology_dir if args.use_topology else None,
+        use_topology=args.use_topology
     )
     val_dataset = ProteinLigandDataset(
         file_path=args.protein_ligand_data_path,
@@ -650,7 +710,9 @@ def train_phase2(args, tokenizer, device, run_dir: Path, phase1_checkpoint: Path
         max_protein_len=config.protein_max_seq_len,
         total_lines=total_lines,
         split='val',
-        split_ratio=train_split_ratio
+        split_ratio=train_split_ratio,
+        topology_dir=args.topology_dir if args.use_topology else None,
+        use_topology=args.use_topology
     )
     
     # Collate function for protein-conditioned training
@@ -678,21 +740,32 @@ def train_phase2(args, tokenizer, device, run_dir: Path, phase1_checkpoint: Path
     
     logging.info(f"Phase 2 Model: {sum(p.numel() for p in model.parameters()):,} parameters")
     
-    # RESET optimizer and scheduler with fresh learning rate
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    # RESET optimizer with LOWER learning rate for fine-tuning (10x lower)
+    phase2_lr = args.learning_rate / 10.0
+    optimizer = torch.optim.AdamW(model.parameters(), lr=phase2_lr, weight_decay=args.weight_decay)
     scaler = GradScaler(enabled=args.use_amp)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.8, patience=3, threshold=0.01, min_lr=1e-6
+    
+    # Calculate total training steps for cosine schedule
+    steps_per_epoch = len(train_loader) // args.grad_accumulation_steps
+    total_steps = steps_per_epoch * args.phase2_epochs
+    warmup_steps = min(200, total_steps // 20)  # 5% warmup or 200 steps max
+    
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps,
+        min_lr_ratio=0.1
     )
     
-    logging.info(f"Reset optimizer with learning rate: {args.learning_rate}")
+    logging.info(f"Phase 2 LR: {phase2_lr:.2e} (10x lower than Phase 1)")
+    logging.info(f"Phase 2 LR Schedule: {warmup_steps} warmup steps, {total_steps} total steps")
     
     # Training loop
     best_val_loss = float('inf')
     for epoch in range(args.phase2_epochs):
         logging.info(f"[Phase 2] Epoch {epoch + 1}/{args.phase2_epochs}")
         
-        train_metrics = _train_epoch(model, train_loader, optimizer, scaler, device, args)
+        train_metrics = _train_epoch(model, train_loader, optimizer, scaler, device, args, scheduler)
         val_metrics = _validate(model, val_loader, device, args)
         
         current_lr = optimizer.param_groups[0]['lr']
@@ -704,7 +777,7 @@ def train_phase2(args, tokenizer, device, run_dir: Path, phase1_checkpoint: Path
                     f"Acc: {val_metrics['accuracy']:.3f}")
         
         save_training_metrics(run_dir, epoch + 1, train_metrics, val_metrics, current_lr, phase="2")
-        scheduler.step(val_metrics['loss'])
+        # Note: scheduler.step() is now called per-batch in _train_epoch
         
         # Save best model
         if val_metrics['loss'] < best_val_loss:
@@ -801,6 +874,11 @@ def train_single_phase(args, tokenizer, device):
         config.use_cross_attention = True
         config.cross_attention_freq = args.cross_attention_freq
         logging.info(f"Protein conditioning enabled with {args.protein_encoder_layers} encoder layers")
+        
+        # Topology encoding
+        config.use_topology_encoding = args.use_topology
+        if args.use_topology:
+            logging.info(f"Topology encoding enabled, loading from: {args.topology_dir}")
 
     # Datasets and loaders
     if args.use_protein_conditioning:
@@ -1009,6 +1087,11 @@ def main():
     protein_group.add_argument("--protein_encoder_layers", type=int, default=6, help="Number of protein encoder layers")
     protein_group.add_argument("--protein_encoder_heads", type=int, default=8, help="Number of attention heads in protein encoder")
     protein_group.add_argument("--cross_attention_freq", type=int, default=1, help="Apply cross-attention every N decoder layers")
+    
+    # Topology encoding arguments
+    topo_group = parser.add_argument_group('Topology encoding settings')
+    topo_group.add_argument("--use_topology", action="store_true", help="Enable topology feature loading")
+    topo_group.add_argument("--topology_dir", type=str, default="data/output/topology_features", help="Directory containing topology feature files (.npz)")
 
     # Generation arguments
     gen_group = parser.add_argument_group('Generation settings')

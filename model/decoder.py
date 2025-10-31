@@ -539,7 +539,6 @@ class SMILESGPTDecoder(nn.Module):
         
         # Input embeddings
         self.wte = nn.Embedding(config.vocab_size, config.d_model)
-        nn.init.orthogonal_(self.wte.weight)
         # Positional embeddings
         self.wpe = nn.Embedding(config.max_seq_len, config.d_model)
         # High dropout on embeddings to encourage robustness
@@ -582,13 +581,13 @@ class SMILESGPTDecoder(nn.Module):
         # Initialize weights
         self.apply(self._init_weights)
         
-        # Override initialization for embeddings in larger models
-        if config.d_model > 256:
-            with torch.no_grad():
-                # Use smaller std for position embeddings
-                nn.init.normal_(self.wpe.weight, mean=0.0, std=0.02)
-                # Keep token embeddings with default init
-                nn.init.normal_(self.wte.weight, mean=0.0, std=1.0/math.sqrt(config.d_model))
+        # Consistent initialization for embeddings
+        with torch.no_grad():
+            # Standard initialization for token embeddings
+            std = 1.0 / math.sqrt(config.d_model)
+            nn.init.normal_(self.wte.weight, mean=0.0, std=std)
+            # Smaller std for position embeddings to prevent dominance
+            nn.init.normal_(self.wpe.weight, mean=0.0, std=0.02)
             
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -606,6 +605,7 @@ class SMILESGPTDecoder(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         protein_ids: Optional[torch.Tensor] = None,
         protein_mask: Optional[torch.Tensor] = None,
+        topology_features: Optional[torch.Tensor] = None,
         apply_constraints: bool = False
     ) -> Dict[str, torch.Tensor]:
         """
@@ -616,6 +616,7 @@ class SMILESGPTDecoder(nn.Module):
             attention_mask: Attention mask [batch_size, seq_len]
             protein_ids: Protein token IDs [batch_size, protein_seq_len] (optional)
             protein_mask: Protein attention mask [batch_size, protein_seq_len] (optional)
+            topology_features: Topology features [batch_size, feature_dim] (optional)
             apply_constraints: Backward-compat flag (no-op). Grammar/chem constraints are removed.
         
         Returns:
@@ -627,7 +628,11 @@ class SMILESGPTDecoder(nn.Module):
         # 1. Encode protein if provided
         protein_embeddings = None
         if self.protein_encoder is not None and protein_ids is not None:
-            protein_embeddings = self.protein_encoder(protein_ids, protein_mask)
+            protein_embeddings = self.protein_encoder(
+                protein_ids, 
+                protein_mask, 
+                topology_features=topology_features
+            )
         
         # 2. Get molecule embeddings
         tok_embeds = self.embed_dropout(self.wte(input_ids))
@@ -636,9 +641,6 @@ class SMILESGPTDecoder(nn.Module):
         
         # Scale embeddings for stability
         hidden_states = tok_embeds + self.pos_scale * pos_embeds
-        # Add training-time Gaussian noise to improve robustness
-        if self.training:
-            hidden_states = hidden_states + torch.randn_like(hidden_states) * 0.1
         
         # Apply input layer norm and dropout
         hidden_states = self.input_ln(hidden_states)
@@ -672,7 +674,8 @@ class SMILESGPTDecoder(nn.Module):
                     input_ids: torch.Tensor,
                     attention_mask: Optional[torch.Tensor] = None,
                     protein_ids: Optional[torch.Tensor] = None,
-                    protein_mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+                    protein_mask: Optional[torch.Tensor] = None,
+                    topology_features: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """
         Compute autoregressive reconstruction loss for molecular generation.
         
@@ -684,14 +687,22 @@ class SMILESGPTDecoder(nn.Module):
             attention_mask: Attention mask [batch_size, seq_len]
             protein_ids: Protein token IDs [batch_size, protein_seq_len] (optional)
             protein_mask: Protein attention mask [batch_size, protein_seq_len] (optional)
+            topology_features: Topology features [batch_size, feature_dim] (optional)
         
         Returns:
             Dictionary with loss components
         """
         # Forward pass
-        model_output = self.forward(input_ids, attention_mask, protein_ids, protein_mask)
+        model_output = self.forward(
+            input_ids, 
+            attention_mask, 
+            protein_ids, 
+            protein_mask,
+            topology_features=topology_features
+        )
         logits = model_output['logits']
-        logits = torch.clamp(logits, min=-10, max=10)
+        # Allow more confident predictions - less aggressive clamping
+        logits = torch.clamp(logits, min=-30, max=30)
         
         # Shift for next-token prediction
         # Input: [BOS, tok1, tok2, ...]

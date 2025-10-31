@@ -19,6 +19,7 @@ set -euo pipefail  # Exit on error, undefined vars, pipe failures
 # --- Configuration ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_SCRIPT="$SCRIPT_DIR/prepare_crossdock.py"
+TOPOLOGY_SCRIPT="$SCRIPT_DIR/extract_topology_features.py"
 LOG_DIR="$SCRIPT_DIR/logs"
 
 # State and Logging
@@ -39,6 +40,8 @@ RESUME=true
 DEBUG_MODE=false
 WORKERS=$(nproc --all 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 MAX_PAIRS=10000  # Default to 10K pairs for initial testing
+EXTRACT_TOPOLOGY=true  # Extract topology features by default
+TOPOLOGY_CUTOFF=10.0   # Distance cutoff for pocket definition (Angstroms)
 
 # --- UI Colors ---
 RED='\033[0;31m'
@@ -78,8 +81,13 @@ show_banner() {
     echo "║                CrossDock2020 Protein-Ligand Dataset Pipeline                 ║"
     echo "╚══════════════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
-    echo -e "${BLUE}Features: Robust downloads • Data processing • CSV pair generation${NC}"
+    echo -e "${BLUE}Features: Robust downloads • Data processing • Topology extraction${NC}"
     echo -e "${BLUE}Output: Protein-ligand pairs → $OUTPUT_CSV${NC}"
+    if [ "$EXTRACT_TOPOLOGY" = true ]; then
+        echo -e "${GREEN}        Topology features → data/output/topology_features/ [ENABLED]${NC}"
+    else
+        echo -e "${YELLOW}        Topology features → [DISABLED]${NC}"
+    fi
     echo ""
 }
 
@@ -95,6 +103,11 @@ ${GREEN}Basic Options:${NC}
 ${GREEN}Processing Options:${NC}
   --workers NUM            Number of parallel workers for processing (default: $WORKERS)
   --max-pairs NUM          Maximum number of pairs to process (default: $MAX_PAIRS, 0=all)
+
+${GREEN}Topology Feature Extraction:${NC}
+  --topology               Extract topology features (default: enabled)
+  --no-topology            Skip topology feature extraction
+  --topology-cutoff NUM    Distance cutoff for pocket (default: $TOPOLOGY_CUTOFF Å)
   
 ${GREEN}Advanced & Process Control:${NC}
   -r, --resume             Resume previous job (default: enabled)
@@ -106,9 +119,10 @@ ${GREEN}Advanced & Process Control:${NC}
   -h, --help               Show this help message
 
 ${YELLOW}Examples:${NC}
-  $0                                # Download and process CrossDock2020 dataset (10K pairs)
-  $0 --max-pairs 100000             # Process 100K pairs
-  $0 --max-pairs 0                  # Process ALL pairs (~100K+)
+  $0                                # Download and process with topology (10K pairs)
+  $0 --max-pairs 100000             # Process 100K pairs with topology
+  $0 --no-topology                  # Skip topology extraction
+  $0 --topology-cutoff 12.0         # Use 12Å cutoff for pocket
   $0 -s                             # Check current job status
   $0 -k                             # Stop the running job
 EOF
@@ -137,11 +151,21 @@ check_dependencies() {
             missing_python_deps+=("rdkit")
         fi
         
-
-        
-        # Check for other essential packages
+        # Check for pandas
         if ! python3 -c "import pandas" &> /dev/null; then
             missing_python_deps+=("pandas")
+        fi
+        
+        # Check for topology extraction dependencies (if enabled)
+        if [ "$EXTRACT_TOPOLOGY" = true ]; then
+            if ! python3 -c "import Bio" &> /dev/null; then
+                missing_python_deps+=("biopython")
+            fi
+            
+            # giotto-tda is optional - we'll warn but not fail
+            if ! python3 -c "import gtda" &> /dev/null; then
+                log_warn "giotto-tda not found - topology features will use fallback mode"
+            fi
         fi
     fi
     
@@ -173,6 +197,12 @@ check_dependencies() {
                 "pandas")
                     echo -e "${CYAN}For pandas:${NC}"
                     echo "  pip install pandas"
+                    echo ""
+                    ;;
+                "biopython")
+                    echo -e "${CYAN}For BioPython (required for topology):${NC}"
+                    echo "  pip install biopython"
+                    echo "  OR: conda install -c conda-forge biopython"
                     echo ""
                     ;;
             esac
@@ -321,6 +351,9 @@ download_crossdock_files() {
 # =============================================================================
 # Job Monitoring and Control
 # =============================================================================
+#
+# Note: Topology extraction is now integrated into prepare_crossdock.py
+# and happens automatically during main processing when --extract-topology is passed
 
 monitor_pipeline() {
     local pid=$1
@@ -343,17 +376,39 @@ show_completion_stats() {
     local total_pairs
     total_pairs=$(grep -o "Generated [0-9,]* protein-ligand pairs" "$PROGRESS_LOG" | tail -1 | grep -o "[0-9,]*" | tr -d ',' || echo 0)
 
+    # Count topology features if directory exists
+    local topology_count=0
+    local topology_dirs=("$DATA_DIR/output/topology_features" "$DATA_DIR/topology_features")
+    for topo_dir in "${topology_dirs[@]}"; do
+        if [ -d "$topo_dir" ]; then
+            topology_count=$(find "$topo_dir" -name "*.npz" 2>/dev/null | wc -l)
+            [ "$topology_count" -gt 0 ] && break
+        fi
+    done
+
     echo -e "${GREEN}"
     echo "╔══════════════════════════════════════════════════════════════════════════════╗"
     echo "║                             PIPELINE COMPLETED                             ║"
     echo "╠══════════════════════════════════════════════════════════════════════════════╣"
     printf "║ Protein-Ligand Pairs:   %'12d                                      ║\n" "$total_pairs"
+    if [ "$topology_count" -gt 0 ]; then
+        printf "║ Topology Features:      %'12d distance matrices                    ║\n" "$topology_count"
+    fi
     printf "║ Total Duration:          %02d:%02d:%02d                                           ║\n" "$hours" "$minutes" "$seconds"
     echo "╠══════════════════════════════════════════════════════════════════════════════╣"
     echo "║ Output CSV: $OUTPUT_CSV                                                      ║"
+    if [ "$topology_count" -gt 0 ]; then
+        echo "║ Topology Dir: ${DATA_DIR}/output/topology_features/                          ║"
+    fi
     echo "║ Full logs are available in: $LOG_DIR                                 ║"
     echo "╚══════════════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
+    
+    if [ "$topology_count" -gt 0 ]; then
+        echo -e "\n${GREEN}To train with topology features:${NC}"
+        echo -e "${CYAN}  config.use_topology_encoding = True${NC}"
+        echo -e "${CYAN}  topology_dir='${DATA_DIR}/output/topology_features/'${NC}"
+    fi
 }
 
 # =============================================================================
@@ -386,6 +441,12 @@ start_pipeline() {
     log_info "Workers: $WORKERS"
     log_info "Max pairs to process: $MAX_PAIRS"
     
+    if [ "$EXTRACT_TOPOLOGY" = true ]; then
+        log_info "Topology extraction: ENABLED (cutoff: ${TOPOLOGY_CUTOFF}Å)"
+    else
+        log_info "Topology extraction: DISABLED"
+    fi
+    
     local data_cache_dir="$DATA_DIR/crossdocked"
     check_disk_space "$data_cache_dir" 10
     
@@ -406,6 +467,7 @@ start_pipeline() {
     )
     [ "$CLEANUP" = true ] && python_cmd+=(--cleanup)
     [ "$DEBUG_MODE" = true ] && python_cmd+=(--debug)
+    [ "$EXTRACT_TOPOLOGY" = true ] && python_cmd+=(--extract-topology --topology-cutoff "$TOPOLOGY_CUTOFF")
     
     # Execute Python pipeline in the background and monitor it
     "${python_cmd[@]}" 2>&1 | tee -a "$PROGRESS_LOG" &
@@ -420,6 +482,13 @@ start_pipeline() {
         log_success "Pipeline completed successfully!"
         update_state_status "completed"
         show_completion_stats
+        
+        # Note: Topology extraction happens DURING processing (not after)
+        if [ "$EXTRACT_TOPOLOGY" = true ]; then
+            log_info ""
+            log_success "Topology features extracted during processing"
+            log_info "Location: $DATA_DIR/output/topology_features/"
+        fi
     else
         log_error "Pipeline failed with exit code: $exit_code"
         update_state_status "failed"
@@ -523,6 +592,9 @@ main() {
             -d|--data-dir) DATA_DIR="$2"; shift 2 ;;
             --workers) WORKERS="$2"; shift 2 ;;
             --max-pairs) MAX_PAIRS="$2"; shift 2 ;;
+            --topology) EXTRACT_TOPOLOGY=true; shift ;;
+            --no-topology) EXTRACT_TOPOLOGY=false; shift ;;
+            --topology-cutoff) TOPOLOGY_CUTOFF="$2"; shift 2 ;;
             -r|--resume) RESUME=true; shift ;;
             -R|--no-resume) RESUME=false; shift ;;
             -C|--cleanup) CLEANUP=true; shift ;;

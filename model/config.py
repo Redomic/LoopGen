@@ -54,6 +54,15 @@ class ModelConfig:
     protein_vocab_size: int = 25  # 20 amino acids + 5 special tokens
     use_cross_attention: bool = True
     cross_attention_freq: int = 1  # Apply cross-attn every N layers (1 = every layer)
+    
+    # Topology encoding features (Persistent Homology for binding sites)
+    use_topology_encoding: bool = False
+    topology_feature_dim: int = 128  # Dimension of topology features after projection
+    topology_persistence_dims: list = None  # [0, 1, 2] - which homology dimensions
+    topology_n_bins: int = 50  # Number of bins for persistence images
+    topology_representation: str = 'image'  # 'image' or 'landscape'
+    topology_fusion_method: str = 'concat'  # 'concat', 'add', or 'gate'
+    contact_distance_threshold: float = 12.0  # C-alpha cutoff for contact graph (Angstroms)
 
     def __post_init__(self):
         """Validate configuration parameters."""
@@ -66,6 +75,10 @@ class ModelConfig:
         # Grammar/chemistry constraints note for SMILES
         if self.use_grammar_constraint:
             print("Warning: use_grammar_constraint not yet implemented for SMILES generation.")
+        
+        # Set default topology persistence dimensions
+        if self.topology_persistence_dims is None:
+            self.topology_persistence_dims = [0, 1, 2]
 
     @classmethod
     def from_dict(cls, config_dict):

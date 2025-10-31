@@ -654,17 +654,18 @@ def process_pairs_to_training_data(
         successful += 1
     
     # Save results - headerless CSV for training
-    # Format: SMILES,pocket_sequence,affinity
+    # Format: SMILES,pocket_sequence,affinity,pair_id
     if results:
         with open(output_csv, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.writer(csvfile)
             # No header - dataset expects headerless CSV
             for result in results:
-                # Output: SMILES, pocket_sequence, affinity
+                # Output: SMILES, pocket_sequence, affinity, pair_id
                 writer.writerow([
                     result['SMILES'],
                     result['pocket_sequence'],
-                    result['affinity']
+                    result['affinity'],
+                    result['pair_id']
                 ])
         
         logger.info(f"\n✓ Successfully processed {successful} pairs")
@@ -935,6 +936,17 @@ def main():
         action="store_true",
         help="Skip affinity extraction (use pocket length as proxy)"
     )
+    parser.add_argument(
+        "--extract-topology",
+        action="store_true",
+        help="Extract topology features (distance matrices) during processing"
+    )
+    parser.add_argument(
+        "--topology-cutoff",
+        type=float,
+        default=10.0,
+        help="Distance cutoff for topology pocket definition (Angstroms)"
+    )
     
     args = parser.parse_args()
     
@@ -1011,6 +1023,17 @@ def main():
             else:
                 logger.warning("Skipping affinity extraction (--no-affinity flag set)")
             
+            # Extract topology features if requested (BEFORE processing to CSV)
+            if args.extract_topology:
+                topology_dir = output_dir / "topology_features"
+                logger.info(f"\nExtracting topology features...")
+                extract_and_cache_distance_matrices(
+                    protein_ligand_pairs=pairs,
+                    output_dir=str(topology_dir),
+                    cutoff=args.topology_cutoff,
+                    max_pairs=None  # Process all found pairs
+                )
+            
             # Process with regular function (files on disk)
             process_pairs_to_training_data(
                 pairs,
@@ -1086,6 +1109,60 @@ def main():
             import traceback
             traceback.print_exc()
         sys.exit(1)
+
+
+def extract_and_cache_distance_matrices(
+    protein_ligand_pairs: List[Tuple[str, str]],
+    output_dir: str,
+    cutoff: float = 10.0,
+    max_pairs: Optional[int] = None
+) -> Dict[str, bool]:
+    """
+    Extract C-alpha distance matrices from protein-ligand pairs for topology encoding.
+    
+    This function processes PDB files to extract C-alpha coordinates from binding
+    pockets and computes pairwise distance matrices for topological analysis.
+    
+    Args:
+        protein_ligand_pairs: List of (protein_pdb_path, ligand_pdb_path) tuples
+        output_dir: Directory to save distance matrices (.npz files)
+        cutoff: Distance cutoff for pocket definition (Angstroms)
+        max_pairs: Maximum number of pairs to process (None = all)
+        
+    Returns:
+        Dictionary mapping pair_id to success status
+    """
+    logger.info("\n" + "="*70)
+    logger.info("EXTRACTING TOPOLOGY FEATURES (DISTANCE MATRICES)")
+    logger.info("="*70)
+    
+    # Import distance extraction module
+    try:
+        from extract_pdb_distances import batch_process_pdb_files
+    except ImportError:
+        logger.warning("Could not import extract_pdb_distances module")
+        logger.warning("Topology features will not be available")
+        return {}
+    
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    logger.info(f"Output directory: {output_dir}")
+    logger.info(f"Cutoff distance: {cutoff}Å")
+    
+    # Limit pairs if specified
+    if max_pairs:
+        protein_ligand_pairs = protein_ligand_pairs[:max_pairs]
+        logger.info(f"Processing first {max_pairs} pairs")
+    
+    # Process pairs in batch
+    results = batch_process_pdb_files(
+        pdb_pairs=protein_ligand_pairs,
+        output_dir=output_dir,
+        cutoff=cutoff,
+        overwrite=False
+    )
+    
+    return results
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ Dataset for protein-conditioned molecular generation.
 
 This module provides a dataset class for training models on protein-ligand pairs,
 where each example consists of a SMILES string (ligand) and a protein pocket sequence.
+Optionally loads precomputed topology features from distance matrices.
 """
 
 import torch
@@ -11,9 +12,14 @@ from typing import Optional, Iterator, Dict
 import pandas as pd
 import math
 import random
+import numpy as np
+import os
+import logging
 
 from .tokenizer import SMILESTokenizer
 from .protein_tokenizer import ProteinTokenizer
+
+logger = logging.getLogger(__name__)
 
 
 class ProteinLigandDataset(IterableDataset):
@@ -26,7 +32,10 @@ class ProteinLigandDataset(IterableDataset):
         - affinity: Binding affinity (optional)
         - pair_id: Unique identifier (optional)
     
-    Yields dictionaries with tokenized SMILES and protein sequences.
+    Optionally loads precomputed topology features from distance matrices.
+    
+    Yields dictionaries with tokenized SMILES and protein sequences,
+    plus topology features if available.
     
     Args:
         file_path: Path to CSV file with protein-ligand data
@@ -38,6 +47,8 @@ class ProteinLigandDataset(IterableDataset):
         split: 'train' or 'val'
         split_ratio: Ratio for train/val split (default 0.8)
         shuffle_buffer_size: Size of shuffle buffer for randomization
+        topology_dir: Optional directory with precomputed topology features
+        use_topology: Whether to load and use topology features
     """
     
     def __init__(
@@ -50,7 +61,9 @@ class ProteinLigandDataset(IterableDataset):
         total_lines: int = None,
         split: str = 'train',
         split_ratio: float = 0.8,
-        shuffle_buffer_size: int = 10000
+        shuffle_buffer_size: int = 10000,
+        topology_dir: Optional[str] = None,
+        use_topology: bool = False
     ):
         super().__init__()
         self.file_path = file_path
@@ -60,6 +73,23 @@ class ProteinLigandDataset(IterableDataset):
         self.max_protein_len = max_protein_len
         self.split = split
         self.shuffle_buffer_size = shuffle_buffer_size
+        self.topology_dir = topology_dir
+        self.use_topology = use_topology
+        
+        # Initialize topology feature extractor if needed
+        self.topology_extractor = None
+        if self.use_topology:
+            try:
+                from model.topology_encoder import TopologyFeatureExtractor
+                self.topology_extractor = TopologyFeatureExtractor(
+                    homology_dimensions=[0, 1, 2],
+                    n_bins=50,
+                    representation='image'
+                )
+                logger.info("Initialized topology feature extraction for dataset")
+            except ImportError as e:
+                logger.warning(f"Could not initialize topology extraction: {e}")
+                self.use_topology = False
         
         # Calculate total lines if not provided
         if total_lines is None:
@@ -101,7 +131,7 @@ class ProteinLigandDataset(IterableDataset):
                 self.file_path,
                 chunksize=1000,
                 header=None,  # No header row in the CSV
-                names=['SMILES', 'pocket_sequence', 'affinity'],  # Assign column names
+                names=['SMILES', 'pocket_sequence', 'affinity', 'pair_id'],  # Assign column names
                 skiprows=range(0, self.start_line) if self.start_line > 0 else None,
                 nrows=num_rows_to_read,
                 on_bad_lines='skip'
@@ -112,6 +142,7 @@ class ProteinLigandDataset(IterableDataset):
                     smiles = row.get('SMILES', None)
                     pocket_seq = row.get('pocket_sequence', None)
                     affinity = row.get('affinity', None)
+                    pair_id = row.get('pair_id', None)
                     
                     # Skip invalid rows
                     if not isinstance(smiles, str) or not isinstance(pocket_seq, str):
@@ -121,7 +152,7 @@ class ProteinLigandDataset(IterableDataset):
                         'smiles': smiles.strip(),
                         'pocket_sequence': pocket_seq.strip(),
                         'affinity': affinity if pd.notna(affinity) else None,
-                        'pair_id': None  # Not present in current CSV format
+                        'pair_id': pair_id.strip() if isinstance(pair_id, str) else None
                     }
         
         except FileNotFoundError:
@@ -208,15 +239,51 @@ class ProteinLigandDataset(IterableDataset):
                 self.start_line = original_start
                 self.end_line = original_end
     
+    def _load_topology_features(self, pair_id: Optional[str]) -> Optional[np.ndarray]:
+        """
+        Load precomputed topology features for a pair.
+        
+        Args:
+            pair_id: Identifier for the protein-ligand pair
+            
+        Returns:
+            Topology feature vector or None if not available
+        """
+        if not self.use_topology or not self.topology_dir or pair_id is None:
+            return None
+        
+        try:
+            # Try to load distance matrix
+            distance_matrix_path = os.path.join(self.topology_dir, f"{pair_id}.npz")
+            
+            if not os.path.exists(distance_matrix_path):
+                return None
+            
+            # Load distance matrix
+            data = np.load(distance_matrix_path)
+            distance_matrix = data['distance_matrix']
+            
+            # Extract topology features
+            if self.topology_extractor is not None:
+                features = self.topology_extractor.extract_features(distance_matrix)
+                return features
+            
+            return None
+        
+        except Exception as e:
+            logger.debug(f"Error loading topology features for {pair_id}: {e}")
+            return None
+    
     def _tokenize_pair(self, pair_data: Dict) -> Optional[Dict[str, torch.Tensor]]:
         """
-        Tokenize a single protein-ligand pair.
+        Tokenize a single protein-ligand pair and optionally load topology features.
         
         Args:
             pair_data: Dictionary with 'smiles', 'pocket_sequence', etc.
         
         Returns:
-            Dictionary with tokenized sequences or None if tokenization fails
+            Dictionary with tokenized sequences and optional topology features,
+            or None if tokenization fails
         """
         try:
             # Tokenize SMILES
@@ -245,10 +312,21 @@ class ProteinLigandDataset(IterableDataset):
             if pair_data.get('affinity') is not None:
                 result['affinity'] = torch.tensor(pair_data['affinity'], dtype=torch.float)
             
+            # Load topology features if enabled
+            if self.use_topology:
+                topology_features = self._load_topology_features(pair_data.get('pair_id'))
+                if topology_features is not None:
+                    result['topology_features'] = torch.from_numpy(topology_features).float()
+                else:
+                    # Use zero features if topology not available
+                    feature_dim = (50 ** 2) * 3  # Default: 50 bins, 3 homology dims
+                    result['topology_features'] = torch.zeros(feature_dim, dtype=torch.float)
+            
             return result
         
         except Exception as e:
             # Skip pairs that fail tokenization
+            logger.debug(f"Error tokenizing pair: {e}")
             return None
 
 

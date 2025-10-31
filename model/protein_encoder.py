@@ -4,26 +4,34 @@ Protein encoder for conditioning molecular generation on protein binding sites.
 This module implements a transformer-based encoder that processes protein pocket
 sequences (amino acid sequences) and produces contextual embeddings that can be
 used to condition molecule generation via cross-attention.
+
+Optionally integrates topological features from persistent homology for enhanced
+geometric understanding of binding sites.
 """
 
 import torch
 import torch.nn as nn
 from typing import Optional
 from .config import ModelConfig
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class ProteinEncoder(nn.Module):
     """
-    Transformer encoder for protein pocket sequences.
+    Transformer encoder for protein pocket sequences with optional topology encoding.
     
     Takes amino acid sequences from binding pockets and produces contextual
     embeddings that capture the biochemical properties and spatial constraints
-    of the binding site.
+    of the binding site. Optionally fuses topological features from persistent
+    homology for enhanced geometric understanding.
     
     Architecture:
         - Token embeddings for 20 amino acids + special tokens
         - Positional embeddings for sequence order
         - Multi-layer transformer encoder
+        - Optional topology feature fusion
         - Layer normalization
     
     Args:
@@ -33,6 +41,7 @@ class ProteinEncoder(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
+        self.use_topology = config.use_topology_encoding
         
         # Token embeddings for amino acids
         self.token_embedding = nn.Embedding(
@@ -68,6 +77,36 @@ class ProteinEncoder(nn.Module):
         # Final layer norm
         self.layer_norm = nn.LayerNorm(config.d_model, eps=config.layer_norm_eps)
         
+        # Optional topology encoding
+        self.topology_encoder = None
+        self.topology_fusion = None
+        
+        if self.use_topology:
+            try:
+                from .topology_encoder import TopologyEncoder, TopologyFusionLayer
+                
+                self.topology_encoder = TopologyEncoder(
+                    d_model=config.d_model,
+                    homology_dimensions=config.topology_persistence_dims,
+                    n_bins=config.topology_n_bins,
+                    dropout=config.dropout,
+                    representation=config.topology_representation
+                )
+                
+                self.topology_fusion = TopologyFusionLayer(
+                    d_model=config.d_model,
+                    fusion_method=config.topology_fusion_method,
+                    dropout=config.dropout
+                )
+                
+                logger.info("Initialized topology encoding with persistent homology")
+            except ImportError as e:
+                logger.warning(f"Could not initialize topology encoding: {e}")
+                logger.warning("Falling back to sequence-only encoding")
+                self.use_topology = False
+                self.topology_encoder = None
+                self.topology_fusion = None
+        
         # Initialize weights
         self._init_weights()
     
@@ -79,7 +118,8 @@ class ProteinEncoder(nn.Module):
     def forward(
         self, 
         protein_ids: torch.Tensor, 
-        attention_mask: Optional[torch.Tensor] = None
+        attention_mask: Optional[torch.Tensor] = None,
+        topology_features: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Encode protein pocket sequence into contextual embeddings.
@@ -88,6 +128,8 @@ class ProteinEncoder(nn.Module):
             protein_ids: Amino acid token IDs [batch_size, protein_seq_len]
             attention_mask: Mask for padding tokens [batch_size, protein_seq_len]
                            1 for real tokens, 0 for padding
+            topology_features: Pre-extracted topology features [batch_size, feature_dim]
+                             (optional, only used if use_topology=True)
         
         Returns:
             Protein embeddings [batch_size, protein_seq_len, d_model]
@@ -122,6 +164,15 @@ class ProteinEncoder(nn.Module):
         
         # Final layer norm
         encoded = self.layer_norm(encoded)
+        
+        # Fuse with topology features if available
+        if self.use_topology and topology_features is not None:
+            if self.topology_encoder is not None and self.topology_fusion is not None:
+                # Project topology features to model dimension
+                topology_embeddings = self.topology_encoder(topology_features)
+                
+                # Fuse with sequence embeddings
+                encoded = self.topology_fusion(encoded, topology_embeddings)
         
         return encoded
 

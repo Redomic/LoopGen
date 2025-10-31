@@ -5,6 +5,11 @@ rdkit
 SmilesPE
 numpy
 tqdm
+biopython
+scikit-learn
+giotto-tda
+gudhi
+
 # For development and linting
 pylint
 black
