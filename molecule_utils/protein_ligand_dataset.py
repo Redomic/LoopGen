@@ -101,7 +101,7 @@ class ProteinLigandDataset(IterableDataset):
                 self.file_path,
                 chunksize=1000,
                 header=None,  # No header row in the CSV
-                names=['SMILES', 'pocket_sequence', 'affinity'],  # Assign column names
+                names=['SMILES', 'pocket_sequence', 'affinity', 'pair_id'],  # Assign column names
                 skiprows=range(0, self.start_line) if self.start_line > 0 else None,
                 nrows=num_rows_to_read,
                 on_bad_lines='skip'
@@ -112,6 +112,7 @@ class ProteinLigandDataset(IterableDataset):
                     smiles = row.get('SMILES', None)
                     pocket_seq = row.get('pocket_sequence', None)
                     affinity = row.get('affinity', None)
+                    pair_id = row.get('pair_id', None)
                     
                     # Skip invalid rows
                     if not isinstance(smiles, str) or not isinstance(pocket_seq, str):
@@ -121,7 +122,7 @@ class ProteinLigandDataset(IterableDataset):
                         'smiles': smiles.strip(),
                         'pocket_sequence': pocket_seq.strip(),
                         'affinity': affinity if pd.notna(affinity) else None,
-                        'pair_id': None  # Not present in current CSV format
+                        'pair_id': pair_id if pd.notna(pair_id) else None
                     }
         
         except FileNotFoundError:

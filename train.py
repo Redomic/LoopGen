@@ -222,55 +222,84 @@ def _train_epoch(model: SMILESGPTDecoder, loader: DataLoader, optimizer: torch.o
     total_entropy = 0.0
     num_batches = 0
     
-    progress_bar = tqdm(enumerate(loader), total=len(loader), desc="Training")
+    logging.info(f"Starting training epoch with {len(loader)} batches")
     
-    for i, batch in progress_bar:
-        input_ids = batch['input_ids'].to(device)
-        attention_mask = batch['attention_mask'].to(device)
+    try:
+        # Test if we can get an iterator
+        logging.info("Creating data loader iterator...")
+        loader_iter = iter(loader)
+        logging.info("Data loader iterator created successfully")
         
-        # Get protein data if available
-        protein_ids = batch.get('protein_ids')
-        protein_mask = batch.get('protein_mask')
-        if protein_ids is not None:
-            protein_ids = protein_ids.to(device)
-            protein_mask = protein_mask.to(device)
+        progress_bar = tqdm(enumerate(loader), total=len(loader), desc="Training")
         
-        with autocast(device.type, enabled=args.use_amp):
-            # Compute autoregressive loss
-            loss_dict = model.compute_loss(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                protein_ids=protein_ids,
-                protein_mask=protein_mask
-            )
-            
-            loss = loss_dict['loss'] / args.grad_accumulation_steps
-        
-        scaler.scale(loss).backward()
-        
-        if (i + 1) % args.grad_accumulation_steps == 0:
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
-            
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
-        
-        # Update metrics
-        total_loss += loss_dict['loss'].item()
-        total_perplexity += loss_dict['perplexity'].item()
-        total_accuracy += loss_dict['accuracy'].item()
-        total_entropy += loss_dict['entropy'].item()
-        num_batches += 1
-        
-        # Update progress bar with more detailed stats
-        progress_bar.set_postfix({
-            'loss': f"{loss_dict['loss'].item():.3f}",
-            'ppl': f"{loss_dict['perplexity'].item():.2f}",
-            'acc': f"{loss_dict['accuracy'].item():.3f}",
-            'ent': f"{loss_dict['entropy'].item():.2f}",
-            'seq_len': f"{loss_dict['average_sequence_length'].item():.1f}"
-        })
+        for i, batch in progress_bar:
+            if i == 0:
+                logging.info(f"Received first batch with keys: {batch.keys()}")
+            try:
+                input_ids = batch['input_ids'].to(device)
+                attention_mask = batch['attention_mask'].to(device)
+                
+                # Get protein data if available
+                protein_ids = batch.get('protein_ids')
+                protein_mask = batch.get('protein_mask')
+                if protein_ids is not None:
+                    protein_ids = protein_ids.to(device)
+                    protein_mask = protein_mask.to(device)
+                
+                with autocast(device.type, enabled=args.use_amp):
+                    # Compute autoregressive loss
+                    loss_dict = model.compute_loss(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        protein_ids=protein_ids,
+                        protein_mask=protein_mask
+                    )
+                    
+                    loss = loss_dict['loss'] / args.grad_accumulation_steps
+                
+                scaler.scale(loss).backward()
+                
+                if (i + 1) % args.grad_accumulation_steps == 0:
+                    # Gradient clipping
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
+                    
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                
+                # Update metrics
+                total_loss += loss_dict['loss'].item()
+                total_perplexity += loss_dict['perplexity'].item()
+                total_accuracy += loss_dict['accuracy'].item()
+                total_entropy += loss_dict['entropy'].item()
+                num_batches += 1
+                
+                # Update progress bar with more detailed stats
+                progress_bar.set_postfix({
+                    'loss': f"{loss_dict['loss'].item():.3f}",
+                    'ppl': f"{loss_dict['perplexity'].item():.2f}",
+                    'acc': f"{loss_dict['accuracy'].item():.3f}",
+                    'ent': f"{loss_dict['entropy'].item():.2f}",
+                    'seq_len': f"{loss_dict['average_sequence_length'].item():.1f}"
+                })
+            except Exception as batch_error:
+                logging.error(f"Error processing batch {i}: {batch_error}")
+                logging.error(f"Batch keys: {batch.keys()}")
+                if 'input_ids' in batch:
+                    logging.error(f"Input shape: {batch['input_ids'].shape}")
+                if 'protein_ids' in batch:
+                    logging.error(f"Protein shape: {batch['protein_ids'].shape}")
+                import traceback
+                traceback.print_exc()
+                raise
+    except Exception as e:
+        logging.error(f"Training epoch failed: {e}")
+        raise
+    
+    # Safeguard against division by zero
+    if num_batches == 0:
+        logging.error("No batches were processed during training epoch!")
+        raise RuntimeError("Training failed: No batches processed. Check data loader and model compatibility.")
     
     return {
         'loss': total_loss / num_batches,
@@ -290,30 +319,50 @@ def _validate(model: SMILESGPTDecoder, loader: DataLoader, device: torch.device,
     num_batches = 0
     
     with torch.no_grad():
-        for batch in tqdm(loader, desc="Validation"):
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            
-            # Get protein data if available
-            protein_ids = batch.get('protein_ids')
-            protein_mask = batch.get('protein_mask')
-            if protein_ids is not None:
-                protein_ids = protein_ids.to(device)
-                protein_mask = protein_mask.to(device)
-            
-            with autocast(device.type, enabled=args.use_amp):
-                loss_dict = model.compute_loss(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    protein_ids=protein_ids,
-                    protein_mask=protein_mask
-                )
-            
-            total_loss += loss_dict['loss'].item()
-            total_perplexity += loss_dict['perplexity'].item()
-            total_accuracy += loss_dict['accuracy'].item()
-            total_entropy += loss_dict['entropy'].item()
-            num_batches += 1
+        try:
+            for batch in tqdm(loader, desc="Validation"):
+                try:
+                    input_ids = batch['input_ids'].to(device)
+                    attention_mask = batch['attention_mask'].to(device)
+                    
+                    # Get protein data if available
+                    protein_ids = batch.get('protein_ids')
+                    protein_mask = batch.get('protein_mask')
+                    if protein_ids is not None:
+                        protein_ids = protein_ids.to(device)
+                        protein_mask = protein_mask.to(device)
+                    
+                    with autocast(device.type, enabled=args.use_amp):
+                        loss_dict = model.compute_loss(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            protein_ids=protein_ids,
+                            protein_mask=protein_mask
+                        )
+                    
+                    total_loss += loss_dict['loss'].item()
+                    total_perplexity += loss_dict['perplexity'].item()
+                    total_accuracy += loss_dict['accuracy'].item()
+                    total_entropy += loss_dict['entropy'].item()
+                    num_batches += 1
+                except Exception as batch_error:
+                    logging.error(f"Error processing validation batch: {batch_error}")
+                    logging.error(f"Batch keys: {batch.keys()}")
+                    if 'input_ids' in batch:
+                        logging.error(f"Input shape: {batch['input_ids'].shape}")
+                    if 'protein_ids' in batch:
+                        logging.error(f"Protein shape: {batch['protein_ids'].shape}")
+                    import traceback
+                    traceback.print_exc()
+                    raise
+        except Exception as e:
+            logging.error(f"Validation failed: {e}")
+            raise
+    
+    # Safeguard against division by zero
+    if num_batches == 0:
+        logging.error("No batches were processed during validation!")
+        raise RuntimeError("Validation failed: No batches processed. Check data loader and model compatibility.")
     
     return {
         'loss': total_loss / num_batches,
