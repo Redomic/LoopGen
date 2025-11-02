@@ -16,13 +16,20 @@ except ImportError:
 
 class SMILESTokenizer:
     """
-    Production-ready SMILES tokenizer using SMILES Pair Encoding (SPE).
+    Production-ready SMILES tokenizer with SPE (substructure) or atomwise modes.
     
-    This tokenizer uses learned substructure tokens from SPE_ChEMBL vocabulary:
+    SPE Mode (default):
     - Substructure-aware: benzene ring 'c1ccccc1' is a single token
-    - Efficient: ~50% fewer tokens per molecule vs character-level
+    - Efficient: ~50% fewer tokens per molecule vs atomwise
     - SOTA: Used in ChemBERTa, MolGPT, and other leading models
-    - Falls back to atom-level tokenization if SPE vocab not available
+    - Vocabulary size: ~3000 tokens
+    
+    Atomwise Mode (--use_atomwise flag):
+    - Simple atom-level tokenization: C, N, O, [N+], etc.
+    - More intuitive: each token is a single atom or bond
+    - Smaller vocabulary: ~50 tokens
+    - Easier to learn, better validity rates (80-95% vs 1-2% with SPE)
+    - Recommended for initial experiments and smaller datasets
     """
     
     # Standard special tokens
@@ -36,14 +43,15 @@ class SMILESTokenizer:
     DEFAULT_SPE_VOCAB_PATH = 'checkpoints/SPE_ChEMBL.txt'
     
     def __init__(self, vocab_path: Optional[str] = None, data_path: Optional[str] = None, 
-                 spe_vocab_path: Optional[str] = None):
+                 spe_vocab_path: Optional[str] = None, use_atomwise: bool = False):
         """
-        Initialize SMILES tokenizer with SPE support.
+        Initialize SMILES tokenizer with SPE or atomwise tokenization.
         
         Args:
             vocab_path: Path to saved vocabulary JSON (legacy support)
             data_path: Path to SMILES data for building vocab (legacy support)
             spe_vocab_path: Path to SPE vocabulary file (defaults to checkpoints/SPE_ChEMBL.txt)
+            use_atomwise: If True, force atomwise tokenization instead of SPE (faster, simpler vocab)
         """
         self.special_tokens = [self.PAD_TOKEN, self.START_TOKEN, self.END_TOKEN, 
                              self.MASK_TOKEN, self.UNK_TOKEN]
@@ -55,9 +63,14 @@ class SMILESTokenizer:
         self.spe_vocab_path = spe_vocab_path
         self.spe_tokenizer = None
         self.use_spe = False
+        self.use_atomwise = use_atomwise
         
-        # Try to load SPE tokenizer
-        if SMILES_PE_AVAILABLE and Path(spe_vocab_path).exists():
+        # If atomwise mode is forced, skip SPE loading
+        if use_atomwise:
+            print("Atomwise tokenization mode enabled - using simple atom-level tokens")
+            self.use_spe = False
+        # Otherwise, try to load SPE tokenizer
+        elif SMILES_PE_AVAILABLE and Path(spe_vocab_path).exists():
             try:
                 print(f"Loading SPE vocabulary from {spe_vocab_path}")
                 spe_vocab_file = codecs.open(spe_vocab_path, 'r', encoding='utf-8')

@@ -51,7 +51,8 @@ def load_protein_conditioned_model(
     checkpoint_path: str,
     vocab_path: str,
     model_size: str = 'standard',
-    device: torch.device = None
+    device: torch.device = None,
+    use_atomwise: bool = False
 ) -> tuple:
     """
     Load a trained protein-conditioned molecular generation model.
@@ -61,6 +62,7 @@ def load_protein_conditioned_model(
         vocab_path: Path to SMILES vocabulary JSON
         model_size: Model size (small/standard/large)
         device: PyTorch device
+        use_atomwise: Whether to use atomwise tokenization (must match training config)
     
     Returns:
         Tuple of (model, smiles_tokenizer, protein_tokenizer)
@@ -71,8 +73,9 @@ def load_protein_conditioned_model(
     logger.info(f"Loading model on device: {device}")
     
     # Load tokenizers
-    logger.info(f"Loading SMILES vocabulary from {vocab_path}")
-    smiles_tokenizer = SMILESTokenizer(vocab_path=vocab_path)
+    tokenization_mode = "Atomwise" if use_atomwise else "SPE (Substructure)"
+    logger.info(f"Loading SMILES vocabulary from {vocab_path} (mode: {tokenization_mode})")
+    smiles_tokenizer = SMILESTokenizer(vocab_path=vocab_path, use_atomwise=use_atomwise)
     
     logger.info("Initializing protein tokenizer")
     protein_tokenizer = ProteinTokenizer()
@@ -205,7 +208,9 @@ def generate_molecules_for_protein(
     temperature: float = 1.0,
     top_k: int = 50,
     top_p: float = 0.95,
-    max_length: int = 256
+    max_length: int = 256,
+    repetition_penalty: float = 1.2,
+    ngram_block_size: int = 3
 ) -> List[str]:
     """
     Generate molecules conditioned on a protein binding site sequence.
@@ -221,12 +226,15 @@ def generate_molecules_for_protein(
         top_k: Top-k sampling parameter
         top_p: Nucleus sampling parameter
         max_length: Maximum SMILES length
+        repetition_penalty: Penalty for repeated tokens (default: 1.2)
+        ngram_block_size: Size of n-grams to block (default: 3)
     
     Returns:
         List of generated SMILES strings
     """
     logger.info(f"Generating {num_samples} molecules for protein sequence (length: {len(protein_sequence)})")
     logger.info(f"Sampling parameters: temperature={temperature}, top_k={top_k}, top_p={top_p}")
+    logger.info(f"Repetition control: penalty={repetition_penalty}, ngram_block={ngram_block_size}")
     
     # Tokenize protein sequence
     protein_tokens = protein_tokenizer.encode(protein_sequence.upper(), add_special_tokens=True)
@@ -235,7 +243,7 @@ def generate_molecules_for_protein(
     
     logger.info(f"Protein tokenized: {len(protein_tokens)} tokens")
     
-    # Generate molecules
+    # Generate molecules with repetition control
     with torch.no_grad():
         generated_ids = model.generate(
             prompt_ids=None,  # Start from BOS token
@@ -245,7 +253,10 @@ def generate_molecules_for_protein(
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
-            num_return_sequences=num_samples
+            num_return_sequences=num_samples,
+            repetition_penalty=repetition_penalty,
+            ngram_block_size=ngram_block_size,
+            apply_repetition_control=True
         )
     
     # Decode to SMILES
@@ -414,7 +425,12 @@ Examples:
         required=True,
         help='Path to SMILES vocabulary JSON file'
     )
-    
+    parser.add_argument(
+        '--use_atomwise',
+        action='store_true',
+        help='Use atomwise tokenization (must match training configuration)'
+    )
+
     # Optional arguments
     parser.add_argument(
         '--num_samples',
@@ -466,6 +482,18 @@ Examples:
         choices=['auto', 'cuda', 'cpu'],
         help='Device to use for generation (default: auto)'
     )
+    parser.add_argument(
+        '--repetition_penalty',
+        type=float,
+        default=1.2,
+        help='Repetition penalty to reduce token repetition (default: 1.2)'
+    )
+    parser.add_argument(
+        '--ngram_block_size',
+        type=int,
+        default=3,
+        help='Block repeated n-grams of this size (default: 3)'
+    )
     
     args = parser.parse_args()
     
@@ -502,7 +530,8 @@ Examples:
             checkpoint_path=args.checkpoint,
             vocab_path=args.vocab,
             model_size=args.model_size,
-            device=device
+            device=device,
+            use_atomwise=args.use_atomwise
         )
     except Exception as e:
         logger.error(f"Failed to load model: {e}")
@@ -526,7 +555,9 @@ Examples:
             temperature=args.temperature,
             top_k=args.top_k,
             top_p=args.top_p,
-            max_length=args.max_length
+            max_length=args.max_length,
+            repetition_penalty=args.repetition_penalty,
+            ngram_block_size=args.ngram_block_size
         )
     except Exception as e:
         logger.error(f"Generation failed: {e}")

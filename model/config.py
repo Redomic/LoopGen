@@ -1,4 +1,5 @@
 import dataclasses
+from typing import Optional
 
 @dataclasses.dataclass
 class ModelConfig:
@@ -54,6 +55,31 @@ class ModelConfig:
     protein_vocab_size: int = 25  # 20 amino acids + 5 special tokens
     use_cross_attention: bool = True
     cross_attention_freq: int = 1  # Apply cross-attn every N layers (1 = every layer)
+    
+    # RL Training Configuration
+    use_rl_training: bool = True
+    rl_weight_schedule: str = 'progressive'  # 'progressive' or 'fixed'
+    rl_start_epoch: int = 5  # Start RL after N epochs
+    rl_max_weight: float = 0.5  # Maximum RL loss weight
+    ppo_clip_epsilon: float = 0.2
+    ppo_value_coef: float = 0.5
+    ppo_entropy_coef: float = 0.01
+    ppo_num_rollouts: int = 4  # Samples per batch
+    ppo_max_rollout_length: int = 100  # Max tokens in RL rollouts
+    
+    # Reward Function Weights
+    reward_validity_weight: float = 1.0
+    reward_qed_weight: float = 0.0  # Disabled by default for speed (QED calculation is slow)
+    reward_sa_weight: float = 0.0   # Disabled by default for speed (SA score is very slow)
+    
+    # Scheduled Sampling
+    scheduled_sampling_type: str = 'inverse_sigmoid'  # 'linear', 'exponential', 'inverse_sigmoid'
+    scheduled_sampling_k: Optional[float] = None  # Auto-computed based on total epochs
+    scheduled_sampling_warmup: int = 0  # Epochs of full teacher forcing before decay
+    
+    # Repetition Control (Inference only)
+    repetition_penalty: float = 1.2
+    ngram_block_size: int = 3
 
     def __post_init__(self):
         """Validate configuration parameters."""

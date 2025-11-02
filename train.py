@@ -26,6 +26,8 @@ import numpy as np
 
 from model.config import ModelConfig
 from model.decoder import SMILESGPTDecoder
+from model.rl_trainer import MolecularRewardCalculator, PPOTrainer
+from model.scheduled_sampling import ScheduledSamplingScheduler
 from molecule_utils.tokenizer import SMILESTokenizer
 from molecule_utils.dataset import SMILESDataset, collate_fn, count_lines
 
@@ -65,6 +67,19 @@ def save_run_config(args: argparse.Namespace, run_dir: Path, tokenizer: SMILESTo
     
     logging.info("Saved run configuration")
 
+def _to_json_serializable(value):
+    """Convert any value to JSON-serializable format."""
+    if isinstance(value, torch.Tensor):
+        return value.item()
+    elif isinstance(value, (np.integer, np.floating)):
+        return float(value)
+    elif isinstance(value, dict):
+        return {k: _to_json_serializable(v) for k, v in value.items()}
+    elif isinstance(value, (list, tuple)):
+        return [_to_json_serializable(v) for v in value]
+    else:
+        return value
+
 def save_training_metrics(run_dir: Path, epoch: int, train_metrics: Dict, val_metrics: Dict, lr: float, phase: Optional[str] = None):
     """Save training metrics to a JSON file."""
     phase_suffix = f"_phase{phase}" if phase else ""
@@ -74,18 +89,24 @@ def save_training_metrics(run_dir: Path, epoch: int, train_metrics: Dict, val_me
         'epoch': epoch,
         'phase': phase,
         'timestamp': datetime.now().isoformat(),
-        'train_loss': train_metrics['loss'],
-        'train_reconstruction_loss': train_metrics['reconstruction_loss'],
-        'train_perplexity': train_metrics.get('perplexity', 0),
-        'train_accuracy': train_metrics.get('accuracy', 0),
-        'train_entropy': train_metrics.get('entropy', 0),
-        'val_loss': val_metrics['loss'],
-        'val_reconstruction_loss': val_metrics['reconstruction_loss'],
-        'val_perplexity': val_metrics.get('perplexity', 0),
-        'val_accuracy': val_metrics.get('accuracy', 0),
-        'val_entropy': val_metrics.get('entropy', 0),
-        'learning_rate': lr
+        'train_loss': _to_json_serializable(train_metrics.get('loss', 0)),
+        'train_reconstruction_loss': _to_json_serializable(train_metrics.get('reconstruction_loss', 0)),
+        'train_perplexity': _to_json_serializable(train_metrics.get('perplexity', 0)),
+        'train_accuracy': _to_json_serializable(train_metrics.get('accuracy', 0)),
+        'train_entropy': _to_json_serializable(train_metrics.get('entropy', 0)),
+        'val_loss': _to_json_serializable(val_metrics.get('loss', 0)),
+        'val_reconstruction_loss': _to_json_serializable(val_metrics.get('reconstruction_loss', 0)),
+        'val_perplexity': _to_json_serializable(val_metrics.get('perplexity', 0)),
+        'val_accuracy': _to_json_serializable(val_metrics.get('accuracy', 0)),
+        'val_entropy': _to_json_serializable(val_metrics.get('entropy', 0)),
+        'learning_rate': float(lr)
     }
+    
+    # Add any additional RL metrics if present in train_metrics
+    for key in train_metrics.keys():
+        if key.startswith('ppo_') or key in ['validity_rate', 'avg_qed', 'avg_sa', 'ppo_weight', 'tf_prob', 'loss_scalar']:
+            if key != 'loss_scalar':  # Skip loss_scalar, we already have train_loss
+                metrics_entry[f'train_{key}'] = _to_json_serializable(train_metrics[key])
     
     # Append to JSONL file (one JSON object per line)
     with open(metrics_file, 'a') as f:
@@ -309,6 +330,191 @@ def _train_epoch(model: SMILESGPTDecoder, loader: DataLoader, optimizer: torch.o
         'entropy': total_entropy / num_batches
     }
 
+def _train_epoch_hybrid_rl(
+    model: SMILESGPTDecoder, 
+    loader: DataLoader, 
+    optimizer: torch.optim.Optimizer, 
+    scaler: GradScaler, 
+    device: torch.device, 
+    args: argparse.Namespace,
+    ppo_trainer,
+    scheduled_sampler,
+    epoch: int
+) -> Dict[str, float]:
+    """
+    Train one epoch with hybrid teacher forcing + RL approach.
+    
+    Combines:
+    - Standard reconstruction loss (teacher forcing)
+    - PPO reinforcement learning (validity rewards)
+    - Scheduled sampling (gradual transition)
+    """
+    model.train()
+    total_loss = 0.0
+    total_recon_loss = 0.0
+    total_ppo_loss = 0.0
+    total_validity = 0.0
+    total_qed = 0.0
+    total_sa = 0.0
+    total_perplexity = 0.0
+    total_accuracy = 0.0
+    total_entropy = 0.0
+    num_batches = 0
+    num_rl_batches = 0
+    
+    # Running averages for progress bar display
+    running_validity = 0.0
+    running_qed = 0.0
+    running_sa = 0.0
+    
+    # Get teacher forcing probability for this epoch
+    tf_prob = scheduled_sampler.get_probability(epoch)
+    
+    # Calculate RL weight for this epoch
+    if args.use_rl_training and epoch >= args.rl_start_epoch:
+        adjusted_epoch = epoch - args.rl_start_epoch
+        if args.rl_weight_schedule == 'progressive':
+            # Gradually increase RL weight
+            ppo_weight = min(args.rl_max_weight, adjusted_epoch / 20.0)
+        else:  # fixed
+            ppo_weight = args.rl_max_weight
+    else:
+        ppo_weight = 0.0
+    
+    logging.info(f"Hybrid RL training: TF prob={tf_prob:.3f}, PPO weight={ppo_weight:.3f}")
+    
+    progress_bar = tqdm(enumerate(loader), total=len(loader), desc=f"Training (RL={ppo_weight:.2f})")
+    
+    for i, batch in progress_bar:
+        try:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            
+            # Get protein data if available
+            protein_ids = batch.get('protein_ids')
+            protein_mask = batch.get('protein_mask')
+            if protein_ids is not None:
+                protein_ids = protein_ids.to(device)
+                protein_mask = protein_mask.to(device)
+            
+            with autocast(device.type, enabled=args.use_amp):
+                # Compute hybrid loss (reconstruction + PPO)
+                # Apply PPO every 5th batch for speed (40-50% faster than every 2nd batch)
+                use_ppo_this_batch = (ppo_weight > 0 and i % 5 == 0)
+                
+                if use_ppo_this_batch:
+                    loss_dict = model.compute_loss_with_ppo(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        protein_ids=protein_ids,
+                        protein_mask=protein_mask,
+                        ppo_trainer=ppo_trainer,
+                        teacher_forcing_prob=tf_prob,
+                        ppo_weight=ppo_weight
+                    )
+                    num_rl_batches += 1
+                else:
+                    # Standard reconstruction loss
+                    loss_dict = model.compute_loss(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        protein_ids=protein_ids,
+                        protein_mask=protein_mask
+                    )
+                
+                loss = loss_dict['loss'] / args.grad_accumulation_steps
+            
+            scaler.scale(loss).backward()
+            
+            if (i + 1) % args.grad_accumulation_steps == 0:
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
+                
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+            
+            # Update metrics - use loss_scalar if available (from hybrid RL), otherwise convert
+            if 'loss_scalar' in loss_dict:
+                loss_value = loss_dict['loss_scalar']
+            else:
+                loss_value = loss_dict['loss'].item() if isinstance(loss_dict['loss'], torch.Tensor) else loss_dict['loss']
+            
+            total_loss += float(loss_value)
+            
+            # Track reconstruction metrics (available from both standard and RL training)
+            if 'reconstruction_loss' in loss_dict:
+                recon_value = loss_dict['reconstruction_loss']
+                total_recon_loss += recon_value.item() if isinstance(recon_value, torch.Tensor) else float(recon_value)
+            
+            # Track base metrics (perplexity, accuracy, entropy)
+            if 'perplexity' in loss_dict:
+                total_perplexity += float(loss_dict['perplexity'])
+            if 'accuracy' in loss_dict:
+                total_accuracy += float(loss_dict['accuracy'])
+            if 'entropy' in loss_dict:
+                total_entropy += float(loss_dict['entropy'])
+            
+            # Track RL-specific metrics
+            if use_ppo_this_batch and 'ppo_validity_rate' in loss_dict:
+                num_rl_batches += 1
+                total_ppo_loss += float(loss_dict.get('ppo_ppo_loss', 0.0))
+                total_validity += float(loss_dict.get('ppo_validity_rate', 0.0))
+                total_qed += float(loss_dict.get('ppo_avg_qed', 0.0))
+                total_sa += float(loss_dict.get('ppo_avg_sa', 0.0))
+                
+                # Update running averages for display
+                running_validity = total_validity / num_rl_batches
+                running_qed = total_qed / num_rl_batches
+                running_sa = total_sa / num_rl_batches
+            
+            num_batches += 1
+            
+            # Update progress bar
+            postfix = {
+                'loss': f"{loss_value:.3f}",
+            }
+            
+            # Show RL metrics if any RL batches have been processed
+            if num_rl_batches > 0 and ppo_weight > 0:
+                postfix['valid'] = f"{running_validity:.2%}"
+                # Only show QED and SA if they're enabled (non-zero weights)
+                if args.reward_qed_weight > 0:
+                    postfix['qed'] = f"{running_qed:.3f}"
+                if args.reward_sa_weight > 0:
+                    postfix['sa'] = f"{running_sa:.3f}"
+            else:
+                # Show accuracy when RL hasn't started yet
+                if 'accuracy' in loss_dict:
+                    postfix['acc'] = f"{loss_dict['accuracy']:.3f}"
+            
+            progress_bar.set_postfix(postfix)
+            
+        except Exception as batch_error:
+            logging.error(f"Error processing batch {i}: {batch_error}")
+            import traceback
+            traceback.print_exc()
+            raise
+    
+    # Calculate averages
+    metrics = {
+        'loss': total_loss / num_batches,
+        'reconstruction_loss': total_recon_loss / num_batches if total_recon_loss > 0 else total_loss / num_batches,
+        'perplexity': total_perplexity / num_batches if total_perplexity > 0 else 0.0,
+        'accuracy': total_accuracy / num_batches if total_accuracy > 0 else 0.0,
+        'entropy': total_entropy / num_batches if total_entropy > 0 else 0.0,
+        'ppo_weight': ppo_weight,
+        'tf_prob': tf_prob
+    }
+    
+    # Add RL metrics if we used RL this epoch
+    if num_rl_batches > 0:
+        metrics['validity_rate'] = total_validity / num_rl_batches
+        metrics['avg_qed'] = total_qed / num_rl_batches
+        metrics['avg_sa'] = total_sa / num_rl_batches
+    
+    return metrics
+
 def _validate(model: SMILESGPTDecoder, loader: DataLoader, device: torch.device, args: argparse.Namespace) -> Dict[str, float]:
     """Validate model with reconstruction loss."""
     model.eval()
@@ -380,10 +586,10 @@ def generate_molecules(
     protein_ids: Optional[torch.Tensor] = None,
     protein_mask: Optional[torch.Tensor] = None
 ) -> List[str]:
-    """Generate molecules using the model's built-in generation method."""
+    """Generate molecules using the model's built-in generation method with repetition control."""
     model.eval()
     
-    # Generate multiple sequences
+    # Generate multiple sequences with repetition control
     generated_ids = model.generate(
         prompt_ids=None,  # Start from BOS
         protein_ids=protein_ids,
@@ -392,7 +598,10 @@ def generate_molecules(
         temperature=args.temperature,
         top_k=args.top_k,
         top_p=args.top_p,
-        num_return_sequences=args.num_generated
+        num_return_sequences=args.num_generated,
+        repetition_penalty=getattr(args, 'repetition_penalty', 1.2),
+        ngram_block_size=getattr(args, 'ngram_block_size', 3),
+        apply_repetition_control=True
     )
     
     # Decode to SMILES strings
@@ -593,19 +802,64 @@ def train_phase1(args, tokenizer, device, run_dir: Path) -> Path:
         optimizer, mode='min', factor=0.8, patience=3, threshold=0.01, min_lr=1e-6
     )
     
+    # Initialize RL components
+    reward_calculator = None
+    ppo_trainer = None
+    scheduled_sampler = None
+    
+    if args.use_rl_training:
+        logging.info("[Phase 1] Initializing RL components (PPO + Scheduled Sampling)")
+        try:
+            reward_calculator = MolecularRewardCalculator(
+                validity_weight=args.reward_validity_weight,
+                qed_weight=args.reward_qed_weight,
+                sa_weight=args.reward_sa_weight
+            )
+            ppo_trainer = PPOTrainer(
+                model=model,
+                tokenizer=tokenizer,
+                reward_calculator=reward_calculator,
+                clip_epsilon=args.ppo_clip_epsilon,
+                value_coef=args.ppo_value_coef,
+                entropy_coef=args.ppo_entropy_coef,
+                max_rollout_length=100
+            )
+            scheduled_sampler = ScheduledSamplingScheduler(
+                total_epochs=args.phase1_epochs,
+                schedule_type=args.scheduled_sampling_type,
+                warmup_epochs=args.rl_start_epoch
+            )
+            logging.info(f"[Phase 1] RL initialized: {scheduled_sampler}")
+        except Exception as e:
+            logging.warning(f"[Phase 1] Failed to initialize RL components: {e}")
+            logging.warning("[Phase 1] Falling back to standard training without RL")
+            args.use_rl_training = False
+    
     # Training loop
     best_val_loss = float('inf')
     for epoch in range(args.phase1_epochs):
         logging.info(f"[Phase 1] Epoch {epoch + 1}/{args.phase1_epochs}")
         
-        train_metrics = _train_epoch(model, train_loader, optimizer, scaler, device, args)
+        # Use hybrid RL training if enabled, otherwise standard training
+        if args.use_rl_training and ppo_trainer is not None:
+            train_metrics = _train_epoch_hybrid_rl(
+                model, train_loader, optimizer, scaler, device, args,
+                ppo_trainer, scheduled_sampler, epoch
+            )
+        else:
+            train_metrics = _train_epoch(model, train_loader, optimizer, scaler, device, args)
         val_metrics = _validate(model, val_loader, device, args)
         
         current_lr = optimizer.param_groups[0]['lr']
         
         logging.info(f"[Phase 1] Epoch {epoch + 1}")
-        logging.info(f"  Train - Loss: {train_metrics['loss']:.4f}, PPL: {train_metrics['perplexity']:.2f}, "
-                    f"Acc: {train_metrics['accuracy']:.3f}")
+        
+        # Build training metrics string
+        train_str = f"  Train - Loss: {train_metrics['loss']:.4f}, PPL: {train_metrics['perplexity']:.2f}, Acc: {train_metrics['accuracy']:.3f}"
+        if 'validity_rate' in train_metrics:
+            train_str += f", Valid: {train_metrics['validity_rate']:.2%}"
+        logging.info(train_str)
+        
         logging.info(f"  Val   - Loss: {val_metrics['loss']:.4f}, PPL: {val_metrics['perplexity']:.2f}, "
                     f"Acc: {val_metrics['accuracy']:.3f}")
         
@@ -736,19 +990,64 @@ def train_phase2(args, tokenizer, device, run_dir: Path, phase1_checkpoint: Path
     
     logging.info(f"Reset optimizer with learning rate: {args.learning_rate}")
     
+    # Initialize RL components
+    reward_calculator = None
+    ppo_trainer = None
+    scheduled_sampler = None
+    
+    if args.use_rl_training:
+        logging.info("[Phase 2] Initializing RL components (PPO + Scheduled Sampling)")
+        try:
+            reward_calculator = MolecularRewardCalculator(
+                validity_weight=args.reward_validity_weight,
+                qed_weight=args.reward_qed_weight,
+                sa_weight=args.reward_sa_weight
+            )
+            ppo_trainer = PPOTrainer(
+                model=model,
+                tokenizer=tokenizer,
+                reward_calculator=reward_calculator,
+                clip_epsilon=args.ppo_clip_epsilon,
+                value_coef=args.ppo_value_coef,
+                entropy_coef=args.ppo_entropy_coef,
+                max_rollout_length=100
+            )
+            scheduled_sampler = ScheduledSamplingScheduler(
+                total_epochs=args.phase2_epochs,
+                schedule_type=args.scheduled_sampling_type,
+                warmup_epochs=args.rl_start_epoch
+            )
+            logging.info(f"[Phase 2] RL initialized: {scheduled_sampler}")
+        except Exception as e:
+            logging.warning(f"[Phase 2] Failed to initialize RL components: {e}")
+            logging.warning("[Phase 2] Falling back to standard training without RL")
+            args.use_rl_training = False
+    
     # Training loop
     best_val_loss = float('inf')
     for epoch in range(args.phase2_epochs):
         logging.info(f"[Phase 2] Epoch {epoch + 1}/{args.phase2_epochs}")
         
-        train_metrics = _train_epoch(model, train_loader, optimizer, scaler, device, args)
+        # Use hybrid RL training if enabled, otherwise standard training
+        if args.use_rl_training and ppo_trainer is not None:
+            train_metrics = _train_epoch_hybrid_rl(
+                model, train_loader, optimizer, scaler, device, args,
+                ppo_trainer, scheduled_sampler, epoch
+            )
+        else:
+            train_metrics = _train_epoch(model, train_loader, optimizer, scaler, device, args)
         val_metrics = _validate(model, val_loader, device, args)
         
         current_lr = optimizer.param_groups[0]['lr']
         
         logging.info(f"[Phase 2] Epoch {epoch + 1}")
-        logging.info(f"  Train - Loss: {train_metrics['loss']:.4f}, PPL: {train_metrics['perplexity']:.2f}, "
-                    f"Acc: {train_metrics['accuracy']:.3f}")
+        
+        # Build training metrics string
+        train_str = f"  Train - Loss: {train_metrics['loss']:.4f}, PPL: {train_metrics['perplexity']:.2f}, Acc: {train_metrics['accuracy']:.3f}"
+        if 'validity_rate' in train_metrics:
+            train_str += f", Valid: {train_metrics['validity_rate']:.2%}"
+        logging.info(train_str)
+        
         logging.info(f"  Val   - Loss: {val_metrics['loss']:.4f}, PPL: {val_metrics['perplexity']:.2f}, "
                     f"Acc: {val_metrics['accuracy']:.3f}")
         
@@ -1025,6 +1324,7 @@ def main():
     # Data arguments
     data_group = parser.add_argument_group('Data settings')
     data_group.add_argument("--vocab_path", type=str, default="checkpoints/vocab.json", help="Path to vocabulary file")
+    data_group.add_argument("--use_atomwise", action="store_true", help="Use atomwise tokenization instead of SPE (simpler, faster, ~50 tokens)")
     data_group.add_argument("--val_set_size", type=int, default=10000, help="Size of the validation set")
     data_group.add_argument("--max_seq_len", type=int, default=256, help="Maximum sequence length")
     data_group.add_argument("--dataset_subset_size", type=int, default=None, help="Use a subset of the dataset")
@@ -1059,8 +1359,25 @@ def main():
     protein_group.add_argument("--protein_encoder_heads", type=int, default=8, help="Number of attention heads in protein encoder")
     protein_group.add_argument("--cross_attention_freq", type=int, default=1, help="Apply cross-attention every N decoder layers")
 
+    # RL Training arguments
+    rl_group = parser.add_argument_group('Reinforcement Learning')
+    rl_group.add_argument("--use_rl_training", action="store_true", default=True, help="Enable RL training with PPO")
+    rl_group.add_argument("--rl_start_epoch", type=int, default=5, help="Epoch to start RL training")
+    rl_group.add_argument("--rl_max_weight", type=float, default=0.5, help="Maximum weight for RL loss")
+    rl_group.add_argument("--rl_weight_schedule", type=str, default="progressive", choices=["progressive", "fixed"], help="RL weight schedule")
+    rl_group.add_argument("--ppo_clip_epsilon", type=float, default=0.2, help="PPO clipping parameter")
+    rl_group.add_argument("--ppo_value_coef", type=float, default=0.5, help="PPO value loss coefficient")
+    rl_group.add_argument("--ppo_entropy_coef", type=float, default=0.01, help="PPO entropy coefficient")
+    rl_group.add_argument("--ppo_num_rollouts", type=int, default=4, help="Number of rollouts per batch")
+    rl_group.add_argument("--reward_validity_weight", type=float, default=1.0, help="Weight for validity in reward")
+    rl_group.add_argument("--reward_qed_weight", type=float, default=0.0, help="Weight for QED in reward (0.0 = disabled for speed)")
+    rl_group.add_argument("--reward_sa_weight", type=float, default=0.0, help="Weight for SA score in reward (0.0 = disabled for speed)")
+    rl_group.add_argument("--scheduled_sampling_type", type=str, default="inverse_sigmoid", choices=["linear", "exponential", "inverse_sigmoid"], help="Scheduled sampling strategy")
+
     # Generation arguments
     gen_group = parser.add_argument_group('Generation settings')
+    gen_group.add_argument("--repetition_penalty", type=float, default=1.2, help="Repetition penalty for generation")
+    gen_group.add_argument("--ngram_block_size", type=int, default=3, help="N-gram size for blocking repetitions")
     gen_group.add_argument("--generate_interval", type=int, default=5, help="Generate samples every N epochs")
     gen_group.add_argument("--num_generated", type=int, default=5, help="Number of molecules to generate")
     gen_group.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
@@ -1083,16 +1400,20 @@ def main():
     vocab_path = Path(args.vocab_path)
     if not vocab_path.parent.exists(): vocab_path.parent.mkdir(parents=True, exist_ok=True)
 
+    tokenization_mode = "Atomwise" if args.use_atomwise else "SPE (Substructure)"
+    print(f"Tokenization mode: {tokenization_mode}")
+    
     if not vocab_path.exists():
         print(f"Building vocabulary from {args.data_path}...")
-        tokenizer = SMILESTokenizer(data_path=args.data_path)
+        tokenizer = SMILESTokenizer(data_path=args.data_path, use_atomwise=args.use_atomwise)
         tokenizer.save_vocabulary(str(vocab_path))
         print(f"Vocabulary saved to {vocab_path}")
     else:
         print(f"Loading vocabulary from {vocab_path}")
-        tokenizer = SMILESTokenizer(vocab_path=str(vocab_path))
+        tokenizer = SMILESTokenizer(vocab_path=str(vocab_path), use_atomwise=args.use_atomwise)
     
     print(f"Vocabulary size: {tokenizer.vocab_size}")
+    print(f"Tokenization strategy: {'Atomwise (simple)' if tokenizer.use_atomwise or not tokenizer.use_spe else 'SPE (substructure)'}")
 
     # Analyze sequence length distribution to choose a reasonable cap
     analyze_sequence_lengths(args.data_path, tokenizer)

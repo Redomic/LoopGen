@@ -849,9 +849,12 @@ class SMILESGPTDecoder(nn.Module):
                 temperature: float = 1.0,
                 top_k: int = 50,
                 top_p: float = 0.95,
-                num_return_sequences: int = 1) -> torch.Tensor:
+                num_return_sequences: int = 1,
+                repetition_penalty: float = 1.2,
+                ngram_block_size: int = 3,
+                apply_repetition_control: bool = True) -> torch.Tensor:
         """
-        Generate molecular SMILES sequences autoregressively.
+        Generate molecular SMILES sequences autoregressively with repetition control.
         
         Args:
             prompt_ids: Optional prompt tokens [batch_size, prompt_len]
@@ -862,6 +865,9 @@ class SMILESGPTDecoder(nn.Module):
             top_k: Top-k sampling
             top_p: Nucleus sampling threshold
             num_return_sequences: Number of sequences to generate
+            repetition_penalty: Penalty factor for repeated tokens (default: 1.2)
+            ngram_block_size: Size of n-grams to block (default: 3)
+            apply_repetition_control: Whether to apply repetition penalties (default: True)
         
         Returns:
             Generated token IDs [num_sequences, seq_len]
@@ -887,6 +893,19 @@ class SMILESGPTDecoder(nn.Module):
             # Get logits for next token
             outputs = self.forward(generated, protein_ids=protein_ids, protein_mask=protein_mask)
             next_token_logits = outputs['logits'][:, -1, :] / temperature
+            
+            # Apply repetition control if enabled
+            if apply_repetition_control:
+                # Apply token-level repetition penalty
+                next_token_logits = self._apply_repetition_penalty(
+                    next_token_logits, 
+                    generated, 
+                    repetition_penalty
+                )
+                
+                # Apply n-gram blocking
+                ngram_mask = self._get_ngram_blocked_mask(generated, ngram_block_size)
+                next_token_logits[ngram_mask] = -float('inf')
             
             # Apply top-k and top-p filtering
             filtered_logits = self._top_k_top_p_filtering(next_token_logits, top_k, top_p)
@@ -930,4 +949,177 @@ class SMILESGPTDecoder(nn.Module):
             indices_to_remove = sorted_indices_to_remove.scatter(-1, sorted_indices, sorted_indices_to_remove)
             logits[indices_to_remove] = -float('inf')
         
-        return logits 
+        return logits
+    
+    def _apply_repetition_penalty(
+        self, 
+        logits: torch.Tensor, 
+        generated_tokens: torch.Tensor, 
+        penalty: float = 1.2
+    ) -> torch.Tensor:
+        """
+        Apply repetition penalty to reduce probability of already-generated tokens.
+        
+        This helps prevent the model from generating long monotonous sequences
+        like "CCCCCCCCCC..." by penalizing tokens that have already appeared.
+        
+        Args:
+            logits: Token logits [batch_size, vocab_size]
+            generated_tokens: Previously generated tokens [batch_size, seq_len]
+            penalty: Penalty factor (>1.0 reduces probability, default: 1.2)
+        
+        Returns:
+            Modified logits with repetition penalty applied
+        """
+        if penalty <= 1.0 or generated_tokens.size(1) == 0:
+            return logits
+        
+        batch_size = logits.size(0)
+        
+        for batch_idx in range(batch_size):
+            # Get unique tokens that have been generated
+            unique_tokens = torch.unique(generated_tokens[batch_idx])
+            
+            # Apply penalty: divide logits by penalty factor
+            # This reduces the probability of these tokens
+            logits[batch_idx, unique_tokens] = logits[batch_idx, unique_tokens] / penalty
+        
+        return logits
+    
+    def _get_ngram_blocked_mask(
+        self, 
+        generated_sequence: torch.Tensor, 
+        n: int = 3
+    ) -> torch.Tensor:
+        """
+        Create mask for tokens that would create repeated n-grams.
+        
+        Prevents generating sequences with repeated substructures by blocking
+        tokens that would complete an n-gram that already exists in the sequence.
+        
+        Args:
+            generated_sequence: Already generated tokens [batch_size, seq_len]
+            n: N-gram size (default: 3 for trigrams)
+        
+        Returns:
+            Boolean mask [batch_size, vocab_size] where True = block this token
+        """
+        batch_size, seq_len = generated_sequence.shape
+        vocab_size = self.config.vocab_size
+        device = generated_sequence.device
+        
+        # Initialize mask (False = allowed, True = blocked)
+        block_mask = torch.zeros(batch_size, vocab_size, dtype=torch.bool, device=device)
+        
+        if seq_len < n - 1:
+            # Not enough tokens to form n-grams yet
+            return block_mask
+        
+        for batch_idx in range(batch_size):
+            # Get the last (n-1) tokens - these will form the prefix
+            # We're checking if adding any token would create a repeated n-gram
+            prefix = generated_sequence[batch_idx, -(n-1):].tolist()
+            
+            # Extract all existing n-grams from the sequence
+            existing_ngrams = set()
+            for i in range(seq_len - n + 1):
+                ngram = tuple(generated_sequence[batch_idx, i:i+n].tolist())
+                existing_ngrams.add(ngram)
+            
+            # Check each possible next token
+            # Block tokens that would create an n-gram we've already seen
+            for token_id in range(vocab_size):
+                potential_ngram = tuple(prefix + [token_id])
+                if potential_ngram in existing_ngrams:
+                    block_mask[batch_idx, token_id] = True
+        
+        return block_mask
+    
+    def compute_loss_with_ppo(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        protein_ids: Optional[torch.Tensor] = None,
+        protein_mask: Optional[torch.Tensor] = None,
+        ppo_trainer = None,
+        teacher_forcing_prob: float = 1.0,
+        ppo_weight: float = 0.1
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Compute hybrid loss combining teacher forcing reconstruction with PPO.
+        
+        This is the core of the hybrid training approach:
+        1. Standard reconstruction loss (teacher forcing)
+        2. PPO reinforcement learning loss (validity-driven)
+        3. Weighted combination
+        
+        Args:
+            input_ids: Token IDs [batch_size, seq_len]
+            attention_mask: Attention mask [batch_size, seq_len]
+            protein_ids: Protein token IDs (optional)
+            protein_mask: Protein mask (optional)
+            ppo_trainer: PPOTrainer instance for RL updates
+            teacher_forcing_prob: Probability of using teacher forcing (scheduled sampling)
+            ppo_weight: Weight for PPO loss component (0-1)
+        
+        Returns:
+            Dictionary with loss and metrics
+        """
+        # 1. Standard reconstruction loss (teacher forcing)
+        recon_loss_dict = self.compute_loss(
+            input_ids, attention_mask, protein_ids, protein_mask
+        )
+        reconstruction_loss = recon_loss_dict['loss']
+        
+        # 2. PPO loss (if enabled)
+        if ppo_weight > 0 and ppo_trainer is not None:
+            batch_size = input_ids.size(0)
+            ppo_loss, ppo_metrics = ppo_trainer.compute_ppo_loss(
+                batch_size=batch_size,
+                protein_ids=protein_ids,
+                protein_mask=protein_mask,
+                num_rollouts=4  # Generate 4 sequences per batch item
+            )
+        else:
+            ppo_loss = torch.tensor(0.0, device=reconstruction_loss.device)
+            ppo_metrics = {
+                'ppo_loss': 0.0,
+                'policy_loss': 0.0,
+                'value_loss': 0.0,
+                'entropy': 0.0,
+                'avg_reward': 0.0,
+                'validity_rate': 0.0,
+                'avg_qed': 0.0,
+                'avg_sa': 0.0
+            }
+        
+        # 3. Combine losses
+        total_loss = (1 - ppo_weight) * reconstruction_loss + ppo_weight * ppo_loss
+        
+        # Combine metrics - keep loss as tensor for backprop, convert others to scalars
+        result = {}
+        for key, value in recon_loss_dict.items():
+            if key == 'loss':
+                # Skip the original loss, we'll use total_loss instead
+                continue
+            elif isinstance(value, torch.Tensor):
+                result[key] = value.item()
+            else:
+                result[key] = value
+        
+        # IMPORTANT: Keep loss as tensor for backpropagation
+        result['loss'] = total_loss
+        # Store scalar version for logging
+        result['loss_scalar'] = total_loss.item()
+        result['reconstruction_loss'] = reconstruction_loss.item()
+        result['ppo_weight'] = float(ppo_weight)
+        result['teacher_forcing_prob'] = float(teacher_forcing_prob)
+        
+        # Add PPO metrics - ensure all are Python scalars
+        for key, value in ppo_metrics.items():
+            if isinstance(value, torch.Tensor):
+                result[f'ppo_{key}'] = value.item()
+            else:
+                result[f'ppo_{key}'] = float(value)
+        
+        return result 
