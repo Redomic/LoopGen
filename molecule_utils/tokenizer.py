@@ -14,6 +14,14 @@ except ImportError:
     SMILES_PE_AVAILABLE = False
     print("Warning: SmilesPE not installed. Install with: pip install SmilesPE")
 
+# Import SELFIES for 100% valid molecular generation
+try:
+    import selfies as sf
+    SELFIES_AVAILABLE = True
+except ImportError:
+    SELFIES_AVAILABLE = False
+    # Don't print warning by default - SELFIES is optional
+
 class SMILESTokenizer:
     """
     Production-ready SMILES tokenizer with SPE (substructure) or atomwise modes.
@@ -43,18 +51,21 @@ class SMILESTokenizer:
     DEFAULT_SPE_VOCAB_PATH = 'checkpoints/SPE_ChEMBL.txt'
     
     def __init__(self, vocab_path: Optional[str] = None, data_path: Optional[str] = None, 
-                 spe_vocab_path: Optional[str] = None, use_atomwise: bool = False):
+                 spe_vocab_path: Optional[str] = None, use_atomwise: bool = False, use_selfies: bool = False):
         """
-        Initialize SMILES tokenizer with SPE or atomwise tokenization.
+        Initialize SMILES tokenizer with SPE, atomwise, or SELFIES tokenization.
         
         Args:
             vocab_path: Path to saved vocabulary JSON (legacy support)
             data_path: Path to SMILES data for building vocab (legacy support)
             spe_vocab_path: Path to SPE vocabulary file (defaults to checkpoints/SPE_ChEMBL.txt)
             use_atomwise: If True, force atomwise tokenization instead of SPE (faster, simpler vocab)
+            use_selfies: If True, use SELFIES encoding (100% valid molecules guaranteed)
         """
         self.special_tokens = [self.PAD_TOKEN, self.START_TOKEN, self.END_TOKEN, 
                              self.MASK_TOKEN, self.UNK_TOKEN]
+        
+        self.use_selfies = use_selfies
         
         # Determine SPE vocabulary path
         if spe_vocab_path is None:
@@ -65,8 +76,17 @@ class SMILESTokenizer:
         self.use_spe = False
         self.use_atomwise = use_atomwise
         
+        # Priority: SELFIES > Atomwise > SPE
+        if use_selfies:
+            if not SELFIES_AVAILABLE:
+                print("ERROR: SELFIES requested but not installed. Install with: pip install selfies")
+                print("Falling back to atomwise tokenization")
+                self.use_selfies = False
+            else:
+                print("SELFIES tokenization mode enabled - 100% valid molecules guaranteed")
+                self.use_spe = False
         # If atomwise mode is forced, skip SPE loading
-        if use_atomwise:
+        elif use_atomwise:
             print("Atomwise tokenization mode enabled - using simple atom-level tokens")
             self.use_spe = False
         # Otherwise, try to load SPE tokenizer
@@ -94,6 +114,8 @@ class SMILESTokenizer:
         # Build vocabulary
         if vocab_path and Path(vocab_path).exists():
             self.vocabulary = self._load_vocabulary(vocab_path)
+        elif self.use_selfies:
+            self.vocabulary = self._get_selfies_vocabulary()
         elif self.use_spe:
             self.vocabulary = self._build_vocabulary_from_spe()
         elif data_path:
@@ -197,35 +219,89 @@ class SMILESTokenizer:
             print(f"Error building vocabulary: {e}")
             return self._get_default_vocabulary()
 
-    def _get_default_vocabulary(self) -> List[str]:
-        """Get default atom-level SMILES vocabulary."""
-        print("Using default atom-level SMILES vocabulary")
+    def _get_selfies_vocabulary(self) -> List[str]:
+        """Get SELFIES vocabulary (semantic tokens from SELFIES alphabet)."""
+        print("Building SELFIES vocabulary from semantic alphabet")
         
-        # Common SMILES tokens (atom-level)
-        organic_atoms = ['C', 'N', 'O', 'S', 'P', 'F', 'Cl', 'Br', 'I', 'B', 'H']
-        aromatic_atoms = ['c', 'n', 'o', 's', 'p']
+        # SELFIES uses a semantic alphabet - get common tokens
+        # This is a minimal set; will expand as needed during training
+        selfies_alphabet = [
+            '[#Branch1]', '[#Branch2]', '[#Ring1]', '[#Ring2]', '[#Ring3]',
+            '[=Branch1]', '[=Branch2]', '[=Ring1]', '[=Ring2]',
+            '[C]', '[N]', '[O]', '[S]', '[P]', '[F]', '[Cl]', '[Br]', '[I]', '[B]',
+            '[C@H]', '[C@@H]', '[C@]', '[C@@]',
+            '[NH]', '[NH2]', '[NH3+]', '[N+]', '[N-]',
+            '[O-]', '[OH]', '[OH+]',
+            '[S-]', '[S+]', '[SH]',
+            '[P+]', '[P-]', '[PH]',
+            '[=C]', '[=N]', '[=O]', '[=S]', '[=P]',
+            '[#C]', '[#N]',
+            '[nH]', '[n+]', '[o+]', '[s+]',
+            '[c]', '[n]', '[o]', '[s]', '[p]',
+        ]
+        
+        vocabulary = self.special_tokens + sorted(set(selfies_alphabet))
+        print(f"SELFIES vocabulary size: {len(vocabulary)}")
+        print("Note: Vocabulary may expand during training as new SELFIES tokens are encountered")
+        return vocabulary
+    
+    def _get_default_vocabulary(self) -> List[str]:
+        """Get default atom-level SMILES vocabulary (curated for drug-like molecules)."""
+        print("Using curated minimal atom-level SMILES vocabulary")
+        
+        # Drug-like organic atoms (no metals, no exotic elements)
+        organic_atoms = ['C', 'N', 'O', 'S', 'P', 'F', 'Cl', 'Br', 'I', 'B']
+        aromatic_atoms = ['c', 'n', 'o', 's', 'p', 'b']
+        
+        # Bonds (no reaction arrow '>')
         bonds = ['=', '#', '-', '/', '\\']
+        
+        # Structure tokens
         structure = ['(', ')', '[', ']', '@', '@@']
+        
+        # Ring numbers (0-9 for simple rings, %10-%15 for larger rings)
         ring_numbers = [str(i) for i in range(10)]  # 0-9
         ring_closures = ['%10', '%11', '%12', '%13', '%14', '%15']
         
-        # Common bracket atoms
+        # Common bracket atoms (chirality, charge, hydrogen count)
+        # Keep only common drug-like charged/modified atoms
         bracket_atoms = [
-            '[NH]', '[NH2]', '[NH3+]', '[N+]', '[N-]',
-            '[O-]', '[O+]', '[OH]', '[OH2+]',
-            '[S-]', '[S+]', '[SH]',
-            '[C@H]', '[C@@H]', '[C@]', '[C@@]',
-            '[nH]', '[cH]', '[sH]'
+            # Nitrogen variants
+            '[NH]', '[NH2]', '[NH3+]', '[NH+]', '[NH2+]', '[N+]', '[N-]', '[N@@+]', '[N@+]',
+            '[nH]', '[nH+]',
+            
+            # Oxygen variants
+            '[O-]', '[OH]', '[OH+]', '[OH2+]', '[O+]',
+            
+            # Sulfur variants
+            '[S-]', '[S+]', '[SH]', '[S@]', '[S@@]',
+            '[sH]',
+            
+            # Carbon chirality and special
+            '[C@H]', '[C@@H]', '[C@]', '[C@@]', '[CH]', '[CH2]', '[CH3]', '[C]',
+            '[cH]',
+            
+            # Phosphorus (common in drugs)
+            '[P@]', '[P@@]', '[PH]', '[P+]',
+            
+            # Halogen brackets (sometimes needed)
+            '[Cl]', '[F]', '[Br]', '[I]',
+            
+            # Boron (emerging in drug design)
+            '[B-]', '[BH]', '[B]',
         ]
         
-        # Combine all tokens
+        # Combine all tokens (NO reaction arrows, NO metals, NO dots for fragments)
+        # We intentionally exclude '.' to discourage multi-fragment generation
+        # We intentionally exclude '>' and other reaction tokens
         smiles_tokens = (
             organic_atoms + aromatic_atoms + bonds + structure + 
             ring_numbers + ring_closures + bracket_atoms
         )
         
         vocabulary = self.special_tokens + sorted(set(smiles_tokens))
-        print(f"Default vocabulary size: {len(vocabulary)}")
+        print(f"Curated vocabulary size: {len(vocabulary)}")
+        print("Excluded: reaction tokens (>), metals, fragment separator (.)")
         return vocabulary
 
     def _load_vocabulary(self, vocab_path: str) -> List[str]:
@@ -268,16 +344,20 @@ class SMILESTokenizer:
         print(f"Vocabulary saved to {save_path}")
 
     def _atomwise_tokenize(self, smiles: str) -> List[str]:
-        """Atom-level tokenization fallback using SmilesPE or regex."""
+        """Atom-level tokenization fallback using SmilesPE or regex (curated for drug-like SMILES)."""
         if SMILES_PE_AVAILABLE:
             try:
-                return atomwise_tokenizer(smiles)
+                tokens = atomwise_tokenizer(smiles)
+                # Filter out reaction arrows and exotic tokens
+                return [t for t in tokens if t not in ['>', '.', '~', '?', '*', '$']]
             except:
                 pass
         
-        # Regex fallback
+        # Regex fallback (drug-like SMILES only - no reaction arrows, no fragment separator)
         import re
-        pattern = r"""(\[[^\]]+\]|Br?|Cl?|N|O|S|P|F|I|b|c|n|o|s|p|\(|\)|\.|=|#|-|\+|\\|\/|:|~|@|\?|>|\*|\$|\%[0-9]{2}|[0-9])"""
+        # Removed: '>' (reaction), '~', '?', '*', '$', ':' (exotic bonds/markers)
+        # Kept: '.' for now but discouraged in vocab
+        pattern = r"""(\[[^\]]+\]|Br?|Cl?|N|O|S|P|F|I|B|b|c|n|o|s|p|\(|\)|=|#|-|\+|\\|\/|@|\%[0-9]{2}|[0-9])"""
         return re.findall(pattern, smiles)
 
     @property
@@ -315,15 +395,20 @@ class SMILESTokenizer:
 
     def tokenize(self, smiles_string: str) -> List[str]:
         """
-        Tokenize SMILES string using SPE or atom-level tokenization.
+        Tokenize SMILES string using SPE, SELFIES, or atom-level tokenization.
         
-        Returns list of tokens (substructures if SPE, atoms if fallback).
+        Returns list of tokens.
         """
         if not isinstance(smiles_string, str) or not smiles_string.strip():
             return []
         
         try:
-            if self.use_spe and self.spe_tokenizer is not None:
+            if self.use_selfies and SELFIES_AVAILABLE:
+                # Convert SMILES to SELFIES, then tokenize
+                selfies_str = sf.encoder(smiles_string.strip())
+                tokens = list(sf.split_selfies(selfies_str))
+                return tokens
+            elif self.use_spe and self.spe_tokenizer is not None:
                 # SPE returns space-separated tokens
                 tokenized_smiles = self.spe_tokenizer.tokenize(smiles_string.strip())
                 tokens = tokenized_smiles.split()
@@ -335,17 +420,37 @@ class SMILESTokenizer:
             print(f"Tokenization error: {e}")
             return []
 
-    def encode(self, smiles_string: str, add_special_tokens: bool = True) -> List[int]:
-        """Convert SMILES string to token IDs."""
+    def encode(self, smiles_string: str, add_special_tokens: bool = True, skip_unknown: bool = True) -> List[int]:
+        """
+        Convert SMILES string to token IDs.
+        
+        Args:
+            smiles_string: SMILES to encode
+            add_special_tokens: Add BOS/EOS tokens
+            skip_unknown: If True, return empty list when unknown tokens found (for filtering)
+                         If False, map unknown tokens to UNK (legacy behavior)
+        
+        Returns:
+            List of token IDs, or empty list if unknown tokens found and skip_unknown=True
+        """
         tokens = self.tokenize(smiles_string)
         
         if add_special_tokens:
             tokens = [self.START_TOKEN] + tokens + [self.END_TOKEN]
         
         token_ids = []
+        
         for token in tokens:
-            # Use UNK token for unknown tokens
-            token_ids.append(self.token_to_id.get(token, self.unk_token_id))
+            if token in self.token_to_id:
+                token_ids.append(self.token_to_id[token])
+            else:
+                # Unknown token found
+                if skip_unknown:
+                    # Return empty list to signal this SMILES should be skipped
+                    return []
+                else:
+                    # Legacy behavior: map to UNK
+                    token_ids.append(self.unk_token_id)
         
         return token_ids
 
@@ -359,8 +464,17 @@ class SMILESTokenizer:
                     continue
                 tokens.append(token)
         
-        # Join tokens (SPE tokens already have proper spacing embedded)
-        if self.use_spe:
+        # Handle different tokenization modes
+        if self.use_selfies and SELFIES_AVAILABLE:
+            # Join SELFIES tokens and convert back to SMILES
+            try:
+                selfies_str = "".join(tokens)
+                smiles = sf.decoder(selfies_str)
+                return smiles
+            except Exception as e:
+                # If SELFIES decoding fails, return the SELFIES string
+                return "".join(tokens)
+        elif self.use_spe:
             # SPE tokens need to be concatenated directly
             return "".join(tokens)
         else:

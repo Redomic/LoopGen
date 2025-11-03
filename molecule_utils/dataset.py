@@ -52,7 +52,9 @@ class SMILESDataset(IterableDataset):
         total_lines: int,
         split: str = 'train',
         split_ratio: float = 0.8,
-        shuffle_buffer_size: int = 100_000
+        shuffle_buffer_size: int = 100_000,
+        use_augmentation: bool = False,
+        augmentation_factor: int = 2
     ):
         super().__init__()
         self.file_path = file_path
@@ -61,6 +63,16 @@ class SMILESDataset(IterableDataset):
         self.split = split
         self.total_lines = total_lines
         self.shuffle_buffer_size = shuffle_buffer_size
+        self.use_augmentation = use_augmentation and split == 'train'  # Only augment training data
+        self.augmentation_factor = augmentation_factor
+        
+        # Initialize augmenter if needed
+        if self.use_augmentation:
+            from .augmentation import SMILESAugmenter
+            self.augmenter = SMILESAugmenter(
+                augmentation_factor=augmentation_factor,
+                include_original=True
+            )
         
         # Calculate the start and end line for this split
         if split == 'train':
@@ -73,7 +85,9 @@ class SMILESDataset(IterableDataset):
             raise ValueError("split must be 'train' or 'val'")
         
         # For iterable datasets, the length is an estimate
-        self.length = self.end_line - self.start_line
+        # If augmentation is on, effective length is larger
+        base_length = self.end_line - self.start_line
+        self.length = base_length * (1 + augmentation_factor) if self.use_augmentation else base_length
 
     def __len__(self):
         return self.length
@@ -120,22 +134,30 @@ class SMILESDataset(IterableDataset):
     def __iter__(self) -> Iterator[torch.Tensor]:
         buffer = []
         for line in self._line_iterator():
-            buffer.append(line)
+            # Apply augmentation if enabled
+            if self.use_augmentation:
+                augmented_smiles = self.augmenter.augment(line)
+                buffer.extend(augmented_smiles)
+            else:
+                buffer.append(line)
+            
             if len(buffer) >= self.shuffle_buffer_size:
                 random.shuffle(buffer)
                 for smiles_string in buffer:
-                    encoded = self.tokenizer.encode(smiles_string, add_special_tokens=True)
-                    # Do not pad or truncate here; return actual sequence length
-                    yield torch.tensor(encoded, dtype=torch.long)
+                    encoded = self.tokenizer.encode(smiles_string, add_special_tokens=True, skip_unknown=True)
+                    # Skip SMILES with unknown tokens (empty encoding)
+                    if len(encoded) > 0:
+                        yield torch.tensor(encoded, dtype=torch.long)
                 buffer = []
         
         # Yield remaining items
         if buffer:
             random.shuffle(buffer)
             for smiles_string in buffer:
-                encoded = self.tokenizer.encode(smiles_string, add_special_tokens=True)
-                # Do not pad or truncate here; return actual sequence length
-                yield torch.tensor(encoded, dtype=torch.long)
+                encoded = self.tokenizer.encode(smiles_string, add_special_tokens=True, skip_unknown=True)
+                # Skip SMILES with unknown tokens (empty encoding)
+                if len(encoded) > 0:
+                    yield torch.tensor(encoded, dtype=torch.long)
 
 
 def collate_fn(batch, pad_token_id=0):

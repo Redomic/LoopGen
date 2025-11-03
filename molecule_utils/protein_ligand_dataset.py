@@ -50,7 +50,9 @@ class ProteinLigandDataset(IterableDataset):
         total_lines: int = None,
         split: str = 'train',
         split_ratio: float = 0.8,
-        shuffle_buffer_size: int = 10000
+        shuffle_buffer_size: int = 10000,
+        use_augmentation: bool = False,
+        augmentation_factor: int = 2
     ):
         super().__init__()
         self.file_path = file_path
@@ -60,6 +62,16 @@ class ProteinLigandDataset(IterableDataset):
         self.max_protein_len = max_protein_len
         self.split = split
         self.shuffle_buffer_size = shuffle_buffer_size
+        self.use_augmentation = use_augmentation and split == 'train'  # Only augment training data
+        self.augmentation_factor = augmentation_factor
+        
+        # Initialize augmenter if needed
+        if self.use_augmentation:
+            from .augmentation import SMILESAugmenter
+            self.augmenter = SMILESAugmenter(
+                augmentation_factor=augmentation_factor,
+                include_original=True
+            )
         
         # Calculate total lines if not provided
         if total_lines is None:
@@ -76,7 +88,9 @@ class ProteinLigandDataset(IterableDataset):
         else:
             raise ValueError("split must be 'train' or 'val'")
         
-        self.length = self.end_line - self.start_line
+        # If augmentation is on, effective length is larger
+        base_length = self.end_line - self.start_line
+        self.length = base_length * (1 + augmentation_factor) if self.use_augmentation else base_length
     
     def _count_lines(self) -> int:
         """Count total lines in CSV file (no header in our format)."""
@@ -182,7 +196,16 @@ class ProteinLigandDataset(IterableDataset):
         
         try:
             for pair_data in self._line_iterator():
-                buffer.append(pair_data)
+                # Apply augmentation if enabled (only to SMILES, not protein)
+                if self.use_augmentation:
+                    augmented_smiles = self.augmenter.augment(pair_data['smiles'])
+                    for aug_smiles in augmented_smiles:
+                        # Create new pair with augmented SMILES
+                        augmented_pair = pair_data.copy()
+                        augmented_pair['smiles'] = aug_smiles
+                        buffer.append(augmented_pair)
+                else:
+                    buffer.append(pair_data)
                 
                 # Shuffle and yield when buffer is full
                 if len(buffer) >= self.shuffle_buffer_size:
@@ -220,11 +243,16 @@ class ProteinLigandDataset(IterableDataset):
             Dictionary with tokenized sequences or None if tokenization fails
         """
         try:
-            # Tokenize SMILES
+            # Tokenize SMILES (skip if unknown tokens)
             smiles_tokens = self.smiles_tokenizer.encode(
                 pair_data['smiles'],
-                add_special_tokens=True
+                add_special_tokens=True,
+                skip_unknown=True
             )
+            
+            # Skip this pair if SMILES contains unknown tokens
+            if len(smiles_tokens) == 0:
+                return None
             
             # Tokenize protein sequence
             protein_tokens = self.protein_tokenizer.encode(
@@ -232,8 +260,8 @@ class ProteinLigandDataset(IterableDataset):
                 add_special_tokens=True
             )
             
-            # Check if sequences are valid length
-            if len(smiles_tokens) == 0 or len(protein_tokens) == 0:
+            # Check if protein sequence is valid length
+            if len(protein_tokens) == 0:
                 return None
             
             # Convert to tensors (no padding here - done in collate_fn)

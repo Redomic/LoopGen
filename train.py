@@ -14,7 +14,7 @@ import random
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -368,6 +368,9 @@ def _train_epoch_hybrid_rl(
     running_sa = 0.0
     
     # Get teacher forcing probability for this epoch
+    # NOTE: Currently logged for monitoring but not actively used in forward pass
+    # The model uses full teacher forcing during reconstruction loss computation
+    # This could be extended to mix model predictions into inputs in future iterations
     tf_prob = scheduled_sampler.get_probability(epoch)
     
     # Calculate RL weight for this epoch
@@ -578,6 +581,61 @@ def _validate(model: SMILESGPTDecoder, loader: DataLoader, device: torch.device,
         'entropy': total_entropy / num_batches
     }
 
+def evaluate_generated_molecules(smiles_list: List[str]) -> Dict[str, float]:
+    """
+    Evaluate validity, uniqueness, and QED for generated molecules.
+    
+    Returns:
+        Dictionary with validity rate, uniqueness, avg QED, and warnings
+    """
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import QED
+        from rdkit import RDLogger
+        RDLogger.DisableLog('rdApp.*')
+    except ImportError:
+        logging.warning("RDKit not available - skipping molecule evaluation")
+        return {
+            'validity': 0.0,
+            'uniqueness': 0.0,
+            'avg_qed': 0.0,
+            'num_valid': 0,
+            'num_unique': 0
+        }
+    
+    valid_smiles = []
+    qed_scores = []
+    
+    for smiles in smiles_list:
+        try:
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is not None:
+                valid_smiles.append(smiles)
+                # Calculate QED if molecule is valid
+                try:
+                    qed = QED.qed(mol)
+                    qed_scores.append(qed)
+                except:
+                    pass
+        except:
+            pass
+    
+    num_valid = len(valid_smiles)
+    num_unique = len(set(valid_smiles))
+    
+    validity_rate = num_valid / len(smiles_list) if smiles_list else 0.0
+    uniqueness = num_unique / num_valid if num_valid > 0 else 0.0
+    avg_qed = sum(qed_scores) / len(qed_scores) if qed_scores else 0.0
+    
+    return {
+        'validity': validity_rate,
+        'uniqueness': uniqueness,
+        'avg_qed': avg_qed,
+        'num_valid': num_valid,
+        'num_unique': num_unique,
+        'total_generated': len(smiles_list)
+    }
+
 def generate_molecules(
     model: SMILESGPTDecoder, 
     tokenizer: SMILESTokenizer, 
@@ -585,8 +643,13 @@ def generate_molecules(
     args,
     protein_ids: Optional[torch.Tensor] = None,
     protein_mask: Optional[torch.Tensor] = None
-) -> List[str]:
-    """Generate molecules using the model's built-in generation method with repetition control."""
+) -> Tuple[List[str], Dict[str, float]]:
+    """
+    Generate molecules and evaluate them.
+    
+    Returns:
+        Tuple of (generated_smiles_list, evaluation_metrics)
+    """
     model.eval()
     
     # Generate multiple sequences with repetition control
@@ -599,7 +662,7 @@ def generate_molecules(
         top_k=args.top_k,
         top_p=args.top_p,
         num_return_sequences=args.num_generated,
-        repetition_penalty=getattr(args, 'repetition_penalty', 1.2),
+        repetition_penalty=getattr(args, 'repetition_penalty', 1.1),
         ngram_block_size=getattr(args, 'ngram_block_size', 3),
         apply_repetition_control=True
     )
@@ -610,7 +673,10 @@ def generate_molecules(
         smiles_str = tokenizer.decode(seq_ids.tolist(), skip_special_tokens=True)
         generated_molecules.append(smiles_str)
     
-    return generated_molecules
+    # Evaluate the generated molecules
+    eval_metrics = evaluate_generated_molecules(generated_molecules)
+    
+    return generated_molecules, eval_metrics
 
 def save_checkpoint(model, optimizer, scheduler, scaler, epoch, best_val_loss, run_dir, phase: Optional[str] = None):
     """Save a complete training checkpoint with epoch-specific naming."""
@@ -636,7 +702,12 @@ def save_checkpoint(model, optimizer, scheduler, scaler, epoch, best_val_loss, r
     logging.info(f"Saved checkpoint for epoch {epoch} to {epoch_checkpoint_path}")
 
 def load_checkpoint(checkpoint_path, model, optimizer, scheduler, scaler, device):
-    """Load a training checkpoint and return the epoch and best validation loss."""
+    """
+    Load a training checkpoint and return the epoch and best validation loss.
+    
+    Note: After loading, caller should call model.set_tokenizer() again to re-initialize
+    grammar constraints if needed.
+    """
     logging.info(f"Loading checkpoint from {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
@@ -652,11 +723,13 @@ def load_checkpoint(checkpoint_path, model, optimizer, scheduler, scaler, device
         best_val_loss = checkpoint['best_val_loss']
         
         logging.info(f"Resuming from epoch {start_epoch}, best validation loss: {best_val_loss:.4f}")
+        logging.info("⚠️  Remember to call model.set_tokenizer() to re-initialize grammar constraints!")
         return start_epoch, best_val_loss
     else:
         # Just model weights (like best_model.pt)
         model.load_state_dict(checkpoint)
         logging.info("Loaded model weights only. Starting from epoch 0 with fresh optimizer/scheduler.")
+        logging.info("⚠️  Remember to call model.set_tokenizer() to re-initialize grammar constraints!")
         return 0, float('inf')
 
 def save_generated_molecules(molecules: List[str], run_dir: Path, epoch: int, phase: Optional[str] = None):
@@ -776,9 +849,12 @@ def train_phase1(args, tokenizer, device, run_dir: Path) -> Path:
     logging.info(f"Phase 1 Dataset size: {total_lines} (Train: {train_size}, Val: {val_size})")
     
     train_dataset = SMILESDataset(args.data_path, tokenizer, config.max_seq_len, 
-                                  total_lines=total_lines, split='train', split_ratio=train_split_ratio)
+                                  total_lines=total_lines, split='train', split_ratio=train_split_ratio,
+                                  use_augmentation=args.use_smiles_augmentation,
+                                  augmentation_factor=args.augmentation_factor)
     val_dataset = SMILESDataset(args.data_path, tokenizer, config.max_seq_len, 
-                                total_lines=total_lines, split='val', split_ratio=train_split_ratio)
+                                total_lines=total_lines, split='val', split_ratio=train_split_ratio,
+                                use_augmentation=False)  # Never augment validation data
     
     # Collate function for autoregressive training
     from functools import partial
@@ -791,7 +867,7 @@ def train_phase1(args, tokenizer, device, run_dir: Path) -> Path:
     
     # Model, optimizer, scaler
     model = SMILESGPTDecoder(config).to(device)
-    model.set_tokenizer(tokenizer)
+    model.set_tokenizer(tokenizer, use_strong_grammar=args.use_strong_grammar)
     model.label_smoothing = args.label_smoothing
     
     logging.info(f"Phase 1 Model: {sum(p.numel() for p in model.parameters()):,} parameters")
@@ -876,13 +952,23 @@ def train_phase1(args, tokenizer, device, run_dir: Path) -> Path:
         # Save checkpoint
         save_checkpoint(model, optimizer, scheduler, scaler, epoch, best_val_loss, run_dir, phase="1")
         
-        # Generate samples
+        # Generate samples and evaluate
         if (epoch + 1) % args.generate_interval == 0:
             logging.info("[Phase 1] Generating molecules...")
-            molecules = generate_molecules(model, tokenizer, device, args)
+            molecules, eval_metrics = generate_molecules(model, tokenizer, device, args)
             save_generated_molecules(molecules, run_dir, epoch + 1, phase="1")
+            
+            # Log evaluation metrics
+            logging.info(f"  [Eval] Validity: {eval_metrics['validity']:.1%} ({eval_metrics['num_valid']}/{eval_metrics['total_generated']})")
+            logging.info(f"  [Eval] Uniqueness: {eval_metrics['uniqueness']:.1%} ({eval_metrics['num_unique']} unique)")
+            logging.info(f"  [Eval] Avg QED: {eval_metrics['avg_qed']:.3f}")
+            
+            # Warning if validity is very low
+            if eval_metrics['validity'] < 0.05:
+                logging.warning(f"  ⚠️  LOW VALIDITY ({eval_metrics['validity']:.1%}) - Consider checking tokenization and constraints")
+            
             for i, mol in enumerate(molecules[:3]):
-                logging.info(f"  Generated {i+1}: {mol}")
+                logging.info(f"  Sample {i+1}: {mol}")
     
     # Save final checkpoint
     phase1_final = run_dir / "phase1_final.pt"
@@ -943,7 +1029,9 @@ def train_phase2(args, tokenizer, device, run_dir: Path, phase1_checkpoint: Path
         max_protein_len=config.protein_max_seq_len,
         total_lines=total_lines,
         split='train',
-        split_ratio=train_split_ratio
+        split_ratio=train_split_ratio,
+        use_augmentation=args.use_smiles_augmentation,
+        augmentation_factor=args.augmentation_factor
     )
     val_dataset = ProteinLigandDataset(
         file_path=args.protein_ligand_data_path,
@@ -953,7 +1041,8 @@ def train_phase2(args, tokenizer, device, run_dir: Path, phase1_checkpoint: Path
         max_protein_len=config.protein_max_seq_len,
         total_lines=total_lines,
         split='val',
-        split_ratio=train_split_ratio
+        split_ratio=train_split_ratio,
+        use_augmentation=False  # Never augment validation data
     )
     
     # Collate function for protein-conditioned training
@@ -973,7 +1062,7 @@ def train_phase2(args, tokenizer, device, run_dir: Path, phase1_checkpoint: Path
     
     # Model with protein conditioning
     model = SMILESGPTDecoder(config).to(device)
-    model.set_tokenizer(tokenizer)
+    model.set_tokenizer(tokenizer, use_strong_grammar=args.use_strong_grammar)
     model.label_smoothing = args.label_smoothing
     
     # Transfer Phase 1 weights
@@ -1072,11 +1161,21 @@ def train_phase2(args, tokenizer, device, run_dir: Path, phase1_checkpoint: Path
             protein_ids = val_sample['protein_ids'][:1].to(device)
             protein_mask = val_sample['protein_mask'][:1].to(device)
             
-            molecules = generate_molecules(model, tokenizer, device, args, 
+            molecules, eval_metrics = generate_molecules(model, tokenizer, device, args, 
                                           protein_ids=protein_ids, protein_mask=protein_mask)
             save_generated_molecules(molecules, run_dir, epoch + 1, phase="2")
+            
+            # Log evaluation metrics
+            logging.info(f"  [Eval] Validity: {eval_metrics['validity']:.1%} ({eval_metrics['num_valid']}/{eval_metrics['total_generated']})")
+            logging.info(f"  [Eval] Uniqueness: {eval_metrics['uniqueness']:.1%} ({eval_metrics['num_unique']} unique)")
+            logging.info(f"  [Eval] Avg QED: {eval_metrics['avg_qed']:.3f}")
+            
+            # Warning if validity is very low
+            if eval_metrics['validity'] < 0.05:
+                logging.warning(f"  ⚠️  LOW VALIDITY ({eval_metrics['validity']:.1%}) - Check model convergence")
+            
             for i, mol in enumerate(molecules[:3]):
-                logging.info(f"  Generated {i+1}: {mol}")
+                logging.info(f"  Sample {i+1}: {mol}")
     
     # Save final checkpoint
     phase2_final = run_dir / "phase2_final.pt"
@@ -1169,7 +1268,9 @@ def train_single_phase(args, tokenizer, device):
             max_protein_len=config.protein_max_seq_len,
             total_lines=total_lines,
             split='train',
-            split_ratio=train_split_ratio
+            split_ratio=train_split_ratio,
+            use_augmentation=args.use_smiles_augmentation,
+            augmentation_factor=args.augmentation_factor
         )
         val_dataset = ProteinLigandDataset(
             file_path=args.protein_ligand_data_path,
@@ -1179,7 +1280,8 @@ def train_single_phase(args, tokenizer, device):
             max_protein_len=config.protein_max_seq_len,
             total_lines=total_lines,
             split='val',
-            split_ratio=train_split_ratio
+            split_ratio=train_split_ratio,
+            use_augmentation=False  # Never augment validation data
         )
         
         # Use protein-conditioned collate function
@@ -1199,8 +1301,10 @@ def train_single_phase(args, tokenizer, device):
         train_split_ratio = train_size / total_lines if total_lines > 0 else 0.0
         logging.info(f"Dataset size: {total_lines} (Train: {train_size}, Val: {val_size})")
 
-        train_dataset = SMILESDataset(args.data_path, tokenizer, config.max_seq_len, total_lines=total_lines, split='train', split_ratio=train_split_ratio)
-        val_dataset = SMILESDataset(args.data_path, tokenizer, config.max_seq_len, total_lines=total_lines, split='val', split_ratio=train_split_ratio)
+        train_dataset = SMILESDataset(args.data_path, tokenizer, config.max_seq_len, total_lines=total_lines, split='train', split_ratio=train_split_ratio,
+                                      use_augmentation=args.use_smiles_augmentation, augmentation_factor=args.augmentation_factor)
+        val_dataset = SMILESDataset(args.data_path, tokenizer, config.max_seq_len, total_lines=total_lines, split='val', split_ratio=train_split_ratio,
+                                    use_augmentation=False)  # Never augment validation data
         
         # Debug dataset diversity
         analyze_dataset(train_dataset, "Train")
@@ -1218,7 +1322,7 @@ def train_single_phase(args, tokenizer, device):
     model = SMILESGPTDecoder(config).to(device)
     
     # Set tokenizer for special tokens
-    model.set_tokenizer(tokenizer)
+    model.set_tokenizer(tokenizer, use_strong_grammar=args.use_strong_grammar)
     
     # Configure label smoothing
     model.label_smoothing = args.label_smoothing
@@ -1250,6 +1354,9 @@ def train_single_phase(args, tokenizer, device):
             start_epoch, best_val_loss = load_checkpoint(
                 checkpoint_path, model, optimizer, scheduler, scaler, device
             )
+            # Re-initialize tokenizer and grammar constraints after loading checkpoint
+            model.set_tokenizer(tokenizer, use_strong_grammar=args.use_strong_grammar)
+            logging.info("✓ Re-initialized grammar constraints after checkpoint load")
         else:
             logging.warning(f"Checkpoint file {checkpoint_path} not found. Starting from scratch.")
     elif args.auto_resume:
@@ -1259,6 +1366,9 @@ def train_single_phase(args, tokenizer, device):
             start_epoch, best_val_loss = load_checkpoint(
                 checkpoint_path, model, optimizer, scheduler, scaler, device
             )
+            # Re-initialize tokenizer and grammar constraints after loading checkpoint
+            model.set_tokenizer(tokenizer, use_strong_grammar=args.use_strong_grammar)
+            logging.info("✓ Re-initialized grammar constraints after checkpoint load")
         else:
             logging.info("No checkpoint found for auto-resume. Starting from scratch.")
 
@@ -1298,12 +1408,21 @@ def train_single_phase(args, tokenizer, device):
 
         if (epoch + 1) % args.generate_interval == 0:
             logging.info("Generating molecules...")
-            molecules = generate_molecules(model, tokenizer, device, args)
+            molecules, eval_metrics = generate_molecules(model, tokenizer, device, args)
             save_generated_molecules(molecules, run_dir, epoch + 1)
             
-            # Also log a few examples
+            # Log evaluation metrics
+            logging.info(f"  [Eval] Validity: {eval_metrics['validity']:.1%} ({eval_metrics['num_valid']}/{eval_metrics['total_generated']})")
+            logging.info(f"  [Eval] Uniqueness: {eval_metrics['uniqueness']:.1%} ({eval_metrics['num_unique']} unique)")
+            logging.info(f"  [Eval] Avg QED: {eval_metrics['avg_qed']:.3f}")
+            
+            # Warning if validity is very low
+            if eval_metrics['validity'] < 0.05:
+                logging.warning(f"  ⚠️  LOW VALIDITY ({eval_metrics['validity']:.1%}) - Review training setup")
+            
+            # Log a few examples
             for i, mol in enumerate(molecules[:3]):
-                logging.info(f"  Generated {i+1}: {mol}")
+                logging.info(f"  Sample {i+1}: {mol}")
 
     logging.info("Training Complete")
 
@@ -1324,7 +1443,8 @@ def main():
     # Data arguments
     data_group = parser.add_argument_group('Data settings')
     data_group.add_argument("--vocab_path", type=str, default="checkpoints/vocab.json", help="Path to vocabulary file")
-    data_group.add_argument("--use_atomwise", action="store_true", help="Use atomwise tokenization instead of SPE (simpler, faster, ~50 tokens)")
+    data_group.add_argument("--use_atomwise", action="store_true", help="Use atomwise tokenization instead of SPE (simpler, faster, ~100 tokens)")
+    data_group.add_argument("--use_selfies", action="store_true", help="Use SELFIES tokenization (100%% valid molecules guaranteed, requires: pip install selfies)")
     data_group.add_argument("--val_set_size", type=int, default=10000, help="Size of the validation set")
     data_group.add_argument("--max_seq_len", type=int, default=256, help="Maximum sequence length")
     data_group.add_argument("--dataset_subset_size", type=int, default=None, help="Use a subset of the dataset")
@@ -1343,10 +1463,10 @@ def main():
     multiphase_group = parser.add_argument_group('Multi-phase training')
     multiphase_group.add_argument("--enable_multiphase", action="store_true", 
                                   help="Enable two-phase training (Phase 1: SMILES pretraining, Phase 2: Protein conditioning)")
-    multiphase_group.add_argument("--phase1_epochs", type=int, default=20, 
-                                  help="Number of epochs for Phase 1 (SMILES pretraining)")
-    multiphase_group.add_argument("--phase2_epochs", type=int, default=30,
-                                  help="Number of epochs for Phase 2 (protein conditioning)")
+    multiphase_group.add_argument("--phase1_epochs", type=int, default=10, 
+                                  help="Number of epochs for Phase 1 (SMILES pretraining) - reduced to 10 for faster iteration")
+    multiphase_group.add_argument("--phase2_epochs", type=int, default=15,
+                                  help="Number of epochs for Phase 2 (protein conditioning) - reduced to 15 for efficiency")
 
     
     # Protein conditioning arguments
@@ -1362,28 +1482,42 @@ def main():
     # RL Training arguments
     rl_group = parser.add_argument_group('Reinforcement Learning')
     rl_group.add_argument("--use_rl_training", action="store_true", default=True, help="Enable RL training with PPO")
-    rl_group.add_argument("--rl_start_epoch", type=int, default=5, help="Epoch to start RL training")
-    rl_group.add_argument("--rl_max_weight", type=float, default=0.5, help="Maximum weight for RL loss")
+    rl_group.add_argument("--rl_start_epoch", type=int, default=2, help="Start RL earlier (epoch 2) for faster validity improvement")
+    rl_group.add_argument("--rl_max_weight", type=float, default=0.4, help="Maximum weight for RL loss (increased to 0.4 for stronger signal)")
     rl_group.add_argument("--rl_weight_schedule", type=str, default="progressive", choices=["progressive", "fixed"], help="RL weight schedule")
     rl_group.add_argument("--ppo_clip_epsilon", type=float, default=0.2, help="PPO clipping parameter")
     rl_group.add_argument("--ppo_value_coef", type=float, default=0.5, help="PPO value loss coefficient")
     rl_group.add_argument("--ppo_entropy_coef", type=float, default=0.01, help="PPO entropy coefficient")
-    rl_group.add_argument("--ppo_num_rollouts", type=int, default=4, help="Number of rollouts per batch")
+    rl_group.add_argument("--ppo_num_rollouts", type=int, default=8, help="Number of rollouts per batch (increased to 8 for better exploration)")
     rl_group.add_argument("--reward_validity_weight", type=float, default=1.0, help="Weight for validity in reward")
-    rl_group.add_argument("--reward_qed_weight", type=float, default=0.0, help="Weight for QED in reward (0.0 = disabled for speed)")
-    rl_group.add_argument("--reward_sa_weight", type=float, default=0.0, help="Weight for SA score in reward (0.0 = disabled for speed)")
+    rl_group.add_argument("--reward_qed_weight", type=float, default=0.2, help="Weight for QED in reward (0.2 = enabled, can disable if too slow)")
+    rl_group.add_argument("--reward_sa_weight", type=float, default=0.0, help="Weight for SA score in reward (0.0 = disabled, SA is very slow)")
     rl_group.add_argument("--scheduled_sampling_type", type=str, default="inverse_sigmoid", choices=["linear", "exponential", "inverse_sigmoid"], help="Scheduled sampling strategy")
 
     # Generation arguments
     gen_group = parser.add_argument_group('Generation settings')
-    gen_group.add_argument("--repetition_penalty", type=float, default=1.2, help="Repetition penalty for generation")
+    gen_group.add_argument("--repetition_penalty", type=float, default=1.1, help="Repetition penalty for generation (safer: 1.1)")
     gen_group.add_argument("--ngram_block_size", type=int, default=3, help="N-gram size for blocking repetitions")
     gen_group.add_argument("--generate_interval", type=int, default=5, help="Generate samples every N epochs")
-    gen_group.add_argument("--num_generated", type=int, default=5, help="Number of molecules to generate")
-    gen_group.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
+    gen_group.add_argument("--num_generated", type=int, default=10, help="Number of molecules to generate (default: 10)")
+    gen_group.add_argument("--temperature", type=float, default=0.85, help="Sampling temperature (safer: 0.8-0.9)")
     gen_group.add_argument("--top_k", type=int, default=50, help="Top-k sampling (0 to disable)")
-    gen_group.add_argument("--top_p", type=float, default=0.95, help="Nucleus sampling threshold")
-    gen_group.add_argument("--use_grammar_constraints", action="store_true", help="Use grammar constraints during generation")
+    gen_group.add_argument("--top_p", type=float, default=0.9, help="Nucleus sampling threshold (safer: 0.9)")
+    gen_group.add_argument("--use_grammar_constraints", action="store_true", help="Use grammar constraints during generation (legacy)")
+    
+    # SOTA Grammar Constraints
+    grammar_group = parser.add_argument_group('SOTA Grammar Constraints')
+    grammar_group.add_argument("--use_strong_grammar", action="store_true", default=True, 
+                               help="Use SOTA CFG-based grammar constraints (default: True, --no-use_strong_grammar to disable)")
+    grammar_group.add_argument("--no-use_strong_grammar", dest="use_strong_grammar", action="store_false",
+                               help="Disable SOTA grammar constraints and use lightweight version")
+    
+    # Data Augmentation
+    aug_group = parser.add_argument_group('Data Augmentation')
+    aug_group.add_argument("--use_smiles_augmentation", action="store_true", 
+                          help="Enable randomized SMILES augmentation (Bjerrum 2017) for improved robustness")
+    aug_group.add_argument("--augmentation_factor", type=int, default=2,
+                          help="Number of random SMILES variants per molecule (default: 2, effective dataset size = N*(1+factor))")
     
     # System arguments
     system_group = parser.add_argument_group('System settings')
@@ -1400,20 +1534,46 @@ def main():
     vocab_path = Path(args.vocab_path)
     if not vocab_path.parent.exists(): vocab_path.parent.mkdir(parents=True, exist_ok=True)
 
-    tokenization_mode = "Atomwise" if args.use_atomwise else "SPE (Substructure)"
+    if args.use_selfies:
+        tokenization_mode = "SELFIES (100% valid)"
+    elif args.use_atomwise:
+        tokenization_mode = "Atomwise"
+    else:
+        tokenization_mode = "SPE (Substructure)"
     print(f"Tokenization mode: {tokenization_mode}")
     
     if not vocab_path.exists():
-        print(f"Building vocabulary from {args.data_path}...")
-        tokenizer = SMILESTokenizer(data_path=args.data_path, use_atomwise=args.use_atomwise)
-        tokenizer.save_vocabulary(str(vocab_path))
-        print(f"Vocabulary saved to {vocab_path}")
+        if args.use_selfies:
+            # Use SELFIES tokenization (100% valid molecules)
+            print("Creating SELFIES vocabulary (100% valid molecules guaranteed)...")
+            tokenizer = SMILESTokenizer(use_selfies=True)
+            tokenizer.save_vocabulary(str(vocab_path))
+            print(f"Vocabulary saved to {vocab_path}")
+        elif args.use_atomwise:
+            # Use curated minimal vocabulary (no data scanning to avoid noisy tokens)
+            print("Creating curated minimal atomwise vocabulary (drug-like atoms only)...")
+            tokenizer = SMILESTokenizer(use_atomwise=True)
+            tokenizer.save_vocabulary(str(vocab_path))
+            print(f"Vocabulary saved to {vocab_path}")
+        else:
+            # SPE mode: build from data
+            vocab_source = args.data_path
+            print(f"Building SPE vocabulary from {vocab_source}...")
+            tokenizer = SMILESTokenizer(data_path=vocab_source, use_atomwise=False)
+            tokenizer.save_vocabulary(str(vocab_path))
+            print(f"Vocabulary saved to {vocab_path}")
     else:
         print(f"Loading vocabulary from {vocab_path}")
-        tokenizer = SMILESTokenizer(vocab_path=str(vocab_path), use_atomwise=args.use_atomwise)
+        tokenizer = SMILESTokenizer(vocab_path=str(vocab_path), use_atomwise=args.use_atomwise, use_selfies=args.use_selfies)
     
     print(f"Vocabulary size: {tokenizer.vocab_size}")
-    print(f"Tokenization strategy: {'Atomwise (simple)' if tokenizer.use_atomwise or not tokenizer.use_spe else 'SPE (substructure)'}")
+    if tokenizer.use_selfies:
+        tokenization_strategy = 'SELFIES (100% valid molecules)'
+    elif tokenizer.use_atomwise or not tokenizer.use_spe:
+        tokenization_strategy = 'Atomwise (simple)'
+    else:
+        tokenization_strategy = 'SPE (substructure)'
+    print(f"Tokenization strategy: {tokenization_strategy}")
 
     # Analyze sequence length distribution to choose a reasonable cap
     analyze_sequence_lengths(args.data_path, tokenizer)

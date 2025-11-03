@@ -662,11 +662,35 @@ class SMILESGPTDecoder(nn.Module):
         
         return {"logits": lm_logits, "hidden_states": hidden_states}
 
-    def set_tokenizer(self, tokenizer):
-        """Set tokenizer to get special token IDs."""
+    def set_tokenizer(self, tokenizer, use_strong_grammar: bool = True):
+        """
+        Set tokenizer to get special token IDs and initialize grammar constraints.
+        
+        Args:
+            tokenizer: SMILESTokenizer instance
+            use_strong_grammar: Whether to use SOTA grammar constraints (default: True)
+        """
         self.pad_token_id = tokenizer.pad_token_id
         self.eos_token_id = tokenizer.eos_token_id
         self.bos_token_id = tokenizer.bos_token_id
+        self.mask_token_id = tokenizer.mask_token_id
+        self.unk_token_id = tokenizer.unk_token_id
+        self.tokenizer = tokenizer
+        
+        # Initialize SOTA grammar constraints
+        self.use_strong_grammar = use_strong_grammar
+        if use_strong_grammar:
+            try:
+                from .smiles_grammar import SMILESGrammarConstraints
+                self.grammar_constraints = SMILESGrammarConstraints(tokenizer)
+                print("✓ Initialized SOTA SMILES grammar constraints")
+            except Exception as e:
+                print(f"Warning: Failed to initialize grammar constraints: {e}")
+                print("Falling back to lightweight constraints")
+                self.use_strong_grammar = False
+                self.grammar_constraints = None
+        else:
+            self.grammar_constraints = None
 
     def compute_loss(self, 
                     input_ids: torch.Tensor,
@@ -894,6 +918,12 @@ class SMILESGPTDecoder(nn.Module):
             outputs = self.forward(generated, protein_ids=protein_ids, protein_mask=protein_mask)
             next_token_logits = outputs['logits'][:, -1, :] / temperature
             
+            # Mask invalid tokens (special tokens, reaction arrows)
+            next_token_logits = self._mask_invalid_tokens(next_token_logits)
+            
+            # Apply SMILES structure constraints
+            next_token_logits = self._apply_smiles_constraints(next_token_logits, generated)
+            
             # Apply repetition control if enabled
             if apply_repetition_control:
                 # Apply token-level repetition penalty
@@ -928,6 +958,191 @@ class SMILESGPTDecoder(nn.Module):
                 break
         
         return generated
+
+    def _mask_invalid_tokens(self, logits: torch.Tensor) -> torch.Tensor:
+        """
+        Mask tokens that should never appear during generation.
+        
+        Blocks:
+        - Special tokens (PAD, BOS, MASK, UNK) mid-sequence
+        - Reaction arrow '>' if present in vocabulary
+        - Fragment separator '.' if present (discourage multi-fragment generation)
+        
+        Args:
+            logits: Token logits [batch_size, vocab_size]
+        
+        Returns:
+            Modified logits with invalid tokens masked to -inf
+        """
+        # Get token IDs from the model's stored IDs
+        bad_token_ids = [
+            self.pad_token_id,
+            self.bos_token_id,  # Don't generate BOS mid-sequence
+        ]
+        
+        # Add MASK and UNK token IDs if they exist
+        if hasattr(self, 'mask_token_id'):
+            bad_token_ids.append(self.mask_token_id)
+        if hasattr(self, 'unk_token_id'):
+            bad_token_ids.append(self.unk_token_id)
+        
+        # Mask these tokens
+        logits[:, bad_token_ids] = -float('inf')
+        
+        # Block reaction arrow and fragment separator if present in vocabulary
+        if hasattr(self, 'tokenizer') and self.tokenizer is not None:
+            token_to_id = self.tokenizer.token_to_id
+            
+            # Block '>' (reaction arrow)
+            if '>' in token_to_id:
+                logits[:, token_to_id['>']] = -float('inf')
+            
+            # Block '.' (fragment separator - we want single molecules)
+            if '.' in token_to_id:
+                logits[:, token_to_id['.']] = -float('inf')
+        
+        return logits
+    
+    def _apply_smiles_constraints(
+        self, 
+        logits: torch.Tensor, 
+        generated: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Apply SMILES grammar constraints to improve validity.
+        
+        Uses SOTA CFG-based constraints if use_strong_grammar=True, otherwise
+        falls back to lightweight constraints for backward compatibility.
+        
+        SOTA Constraints (use_strong_grammar=True):
+        1. Position-aware rules (no bonds/stereo at start)
+        2. Aromatic context tracking (lowercase atoms must be in rings)
+        3. Enhanced ring closure validation (prevent duplicates, force completion)
+        4. Stereochemistry context validation (only after valid atoms)
+        5. Bond symbol position rules
+        6. Bracket/parenthesis balance
+        
+        Lightweight Constraints (use_strong_grammar=False):
+        1. Bracket balance
+        2. Parenthesis balance
+        3. Basic ring digit tracking
+        4. No consecutive bonds
+        
+        Args:
+            logits: Token logits [batch_size, vocab_size]
+            generated: Previously generated tokens [batch_size, seq_len]
+        
+        Returns:
+            Modified logits with constraint violations masked to -inf
+        """
+        if not hasattr(self, 'tokenizer') or self.tokenizer is None:
+            return logits
+        
+        # Use SOTA grammar constraints if available
+        if hasattr(self, 'use_strong_grammar') and self.use_strong_grammar and hasattr(self, 'grammar_constraints'):
+            return self._apply_sota_constraints(logits, generated)
+        
+        # Fallback to lightweight constraints
+        return self._apply_lightweight_constraints(logits, generated)
+    
+    def _apply_sota_constraints(
+        self, 
+        logits: torch.Tensor, 
+        generated: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply SOTA CFG-based grammar constraints."""
+        batch_size = generated.size(0)
+        
+        for batch_idx in range(batch_size):
+            # Get valid tokens for this sequence
+            valid_tokens = self.grammar_constraints.get_valid_tokens(generated[batch_idx])
+            
+            # Mask all invalid tokens
+            invalid_mask = torch.ones(logits.size(-1), dtype=torch.bool, device=logits.device)
+            invalid_mask[list(valid_tokens)] = False
+            logits[batch_idx][invalid_mask] = -float('inf')
+        
+        return logits
+    
+    def _apply_lightweight_constraints(
+        self, 
+        logits: torch.Tensor, 
+        generated: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply lightweight SMILES grammar constraints (backward compatible)."""
+        batch_size = generated.size(0)
+        token_to_id = self.tokenizer.token_to_id
+        id_to_token = self.tokenizer.id_to_token
+        
+        # Get token IDs for constraint checking
+        bracket_open_id = token_to_id.get('[', None)
+        bracket_close_id = token_to_id.get(']', None)
+        paren_open_id = token_to_id.get('(', None)
+        paren_close_id = token_to_id.get(')', None)
+        
+        # Bond token IDs
+        bond_ids = []
+        for bond in ['=', '#', '-', '/', '\\']:
+            if bond in token_to_id:
+                bond_ids.append(token_to_id[bond])
+        
+        # Ring digit IDs (0-9)
+        ring_digit_ids = {}
+        for digit in range(10):
+            digit_str = str(digit)
+            if digit_str in token_to_id:
+                ring_digit_ids[digit] = token_to_id[digit_str]
+        
+        # Process each sequence in batch
+        for batch_idx in range(batch_size):
+            seq = generated[batch_idx].tolist()
+            
+            # Count brackets and parentheses
+            bracket_balance = 0
+            paren_balance = 0
+            open_rings = set()
+            last_token_was_bond = False
+            
+            for token_id in seq:
+                # Track brackets
+                if token_id == bracket_open_id:
+                    bracket_balance += 1
+                elif token_id == bracket_close_id:
+                    bracket_balance -= 1
+                
+                # Track parentheses
+                if token_id == paren_open_id:
+                    paren_balance += 1
+                elif token_id == paren_close_id:
+                    paren_balance -= 1
+                
+                # Track ring digits
+                for digit, ring_id in ring_digit_ids.items():
+                    if token_id == ring_id:
+                        if digit in open_rings:
+                            open_rings.remove(digit)
+                        else:
+                            open_rings.add(digit)
+                
+                # Track if last token was a bond
+                last_token_was_bond = token_id in bond_ids
+            
+            # Apply constraints
+            if bracket_balance <= 0 and bracket_close_id is not None:
+                logits[batch_idx, bracket_close_id] = -float('inf')
+            
+            if paren_balance <= 0 and paren_close_id is not None:
+                logits[batch_idx, paren_close_id] = -float('inf')
+            
+            if last_token_was_bond and bond_ids:
+                logits[batch_idx, bond_ids] = -float('inf')
+            
+            if len(open_rings) >= 3:
+                for digit, ring_id in ring_digit_ids.items():
+                    if digit not in open_rings:
+                        logits[batch_idx, ring_id] *= 0.5
+        
+        return logits
 
     def _top_k_top_p_filtering(self, logits, top_k=50, top_p=0.95):
         """Apply top-k and nucleus (top-p) filtering to logits."""

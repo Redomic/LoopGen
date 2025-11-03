@@ -205,11 +205,11 @@ def generate_molecules_for_protein(
     protein_tokenizer: ProteinTokenizer,
     device: torch.device,
     num_samples: int = 10,
-    temperature: float = 1.0,
+    temperature: float = 0.85,
     top_k: int = 50,
-    top_p: float = 0.95,
-    max_length: int = 256,
-    repetition_penalty: float = 1.2,
+    top_p: float = 0.9,
+    max_length: int = 160,
+    repetition_penalty: float = 1.1,
     ngram_block_size: int = 3
 ) -> List[str]:
     """
@@ -441,8 +441,8 @@ Examples:
     parser.add_argument(
         '--temperature',
         type=float,
-        default=1.0,
-        help='Sampling temperature - higher values increase diversity (default: 1.0)'
+        default=0.85,
+        help='Sampling temperature - safer default 0.85 (0.8-0.9 recommended)'
     )
     parser.add_argument(
         '--top_k',
@@ -453,14 +453,14 @@ Examples:
     parser.add_argument(
         '--top_p',
         type=float,
-        default=0.95,
-        help='Nucleus sampling threshold (default: 0.95)'
+        default=0.9,
+        help='Nucleus sampling threshold - safer default 0.9'
     )
     parser.add_argument(
         '--max_length',
         type=int,
-        default=256,
-        help='Maximum SMILES length (default: 256)'
+        default=160,
+        help='Maximum SMILES length - safer default 160 (shorter reduces errors)'
     )
     parser.add_argument(
         '--model_size',
@@ -485,8 +485,8 @@ Examples:
     parser.add_argument(
         '--repetition_penalty',
         type=float,
-        default=1.2,
-        help='Repetition penalty to reduce token repetition (default: 1.2)'
+        default=1.1,
+        help='Repetition penalty - safer default 1.1'
     )
     parser.add_argument(
         '--ngram_block_size',
