@@ -9,4 +9,10 @@ __pycache__/
 
 /libmolgrid
 
-/checkpoints/
+/checkpoints/*
+!/checkpoints/run_20251103_035000/
+!/checkpoints/run_20251103_035000/**
+/Drafts/
+
+# Ignore all PyTorch checkpoint files even in allowed runs
+*.pt

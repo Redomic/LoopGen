@@ -303,6 +303,8 @@ class PPOTrainer:
         """
         Generate molecules and collect rollout data for PPO update.
         
+        Memory-efficient: Only stores necessary data, clears intermediate tensors.
+        
         Args:
             batch_size: Number of sequences in original batch
             protein_ids: Optional protein conditioning
@@ -346,27 +348,31 @@ class PPOTrainer:
                     protein_mask=protein_mask_expanded
                 )
                 
-                logits = outputs['logits'][:, -1, :]
-                hidden_states = outputs['hidden_states'][:, -1, :]
+                logits = outputs['logits'][:, -1, :].detach()  # Detach to free graph
+                hidden_states = outputs['hidden_states'][:, -1, :].detach()
+                
+                # Clear outputs dict to free memory
+                del outputs
                 
                 # Get value estimates
-                values = self.value_network(hidden_states.unsqueeze(1)).squeeze(1)
+                values = self.value_network(hidden_states.unsqueeze(1)).squeeze(1).detach()
                 
                 # Sample next token
                 probs = F.softmax(logits, dim=-1)
                 dist = torch.distributions.Categorical(probs)
                 next_token = dist.sample()
                 
-                # Calculate log probability
-                log_prob = dist.log_prob(next_token)
+                # Calculate log probability and entropy
+                log_prob = dist.log_prob(next_token).detach()
+                entropy = dist.entropy().detach()
                 
-                # Calculate entropy
-                entropy = dist.entropy()
+                # Store (detached from computation graph)
+                all_log_probs.append(log_prob.cpu())  # Move to CPU to free GPU memory
+                all_values.append(values.cpu())
+                all_entropies.append(entropy.cpu())
                 
-                # Store
-                all_log_probs.append(log_prob)
-                all_values.append(values)
-                all_entropies.append(entropy)
+                # Clear intermediate tensors
+                del logits, hidden_states, probs, dist, values
                 
                 # Append to sequence
                 generated = torch.cat([generated, next_token.unsqueeze(1)], dim=1)
@@ -381,20 +387,23 @@ class PPOTrainer:
             smiles = self.tokenizer.decode(seq.tolist(), skip_special_tokens=True)
             smiles_list.append(smiles)
         
-        # Calculate rewards
+        # Calculate rewards (CPU to avoid GPU memory)
         reward_dict = self.reward_calculator.batch_calculate_rewards(
             smiles_list,
             return_components=True
         )
-        rewards = reward_dict['rewards'].to(device)
+        rewards = reward_dict['rewards']
         
-        # Stack temporal data
-        log_probs = torch.stack(all_log_probs, dim=1)  # [batch, seq_len]
-        values = torch.stack(all_values, dim=1)  # [batch, seq_len]
-        entropies = torch.stack(all_entropies, dim=1)  # [batch, seq_len]
+        # Stack temporal data and move back to device only when needed
+        log_probs = torch.stack(all_log_probs, dim=1)  # [batch, seq_len] on CPU
+        values = torch.stack(all_values, dim=1)  # [batch, seq_len] on CPU
+        entropies = torch.stack(all_entropies, dim=1)  # [batch, seq_len] on CPU
+        
+        # Clear intermediate lists
+        del all_log_probs, all_values, all_entropies
         
         return {
-            'sequences': generated,
+            'sequences': generated.cpu(),  # Move to CPU to free GPU
             'log_probs': log_probs,
             'values': values,
             'entropies': entropies,
@@ -462,6 +471,8 @@ class PPOTrainer:
         """
         Compute PPO loss for a batch.
         
+        Memory-efficient: Properly manages GPU memory, moves data strategically.
+        
         Args:
             batch_size: Size of training batch
             protein_ids: Optional protein conditioning
@@ -472,16 +483,19 @@ class PPOTrainer:
             loss: PPO loss tensor
             metrics: Dictionary of metrics for logging
         """
-        # Collect rollouts
+        device = next(self.model.parameters()).device
+        
+        # Collect rollouts (data is on CPU to save GPU memory)
         rollout_data = self.collect_rollouts(
             batch_size, protein_ids, protein_mask, num_rollouts
         )
         
-        sequences = rollout_data['sequences']
-        old_log_probs = rollout_data['log_probs']
-        old_values = rollout_data['values']
-        old_entropies = rollout_data['entropies']
-        rewards = rollout_data['rewards']
+        # Move data to device only when needed
+        sequences = rollout_data['sequences'].to(device)
+        old_log_probs = rollout_data['log_probs'].to(device)
+        old_values = rollout_data['values'].to(device)
+        old_entropies = rollout_data['entropies'].to(device)
+        rewards = rollout_data['rewards'].to(device)
         
         # Calculate sequence lengths (excluding padding)
         seq_lengths = (sequences != self.model.pad_token_id).sum(dim=1)
@@ -490,6 +504,10 @@ class PPOTrainer:
         advantages, returns = self.compute_advantages(
             old_values, rewards, seq_lengths
         )
+        
+        # Clear old rollout data from GPU
+        del old_values, old_entropies, rewards
+        torch.cuda.empty_cache()
         
         # Now compute new log probs and values with gradients
         self.model.train()
@@ -515,6 +533,9 @@ class PPOTrainer:
         # Calculate new entropies
         probs = F.softmax(logits, dim=-1)
         new_entropies = -(probs * log_probs_all).sum(dim=-1)
+        
+        # Clear intermediate tensors
+        del logits, log_probs_all, probs
         
         # PPO clipped objective
         ratio = torch.exp(new_log_probs - old_log_probs)
@@ -543,17 +564,24 @@ class PPOTrainer:
         value_loss.backward(retain_graph=True)
         self.value_optimizer.step()
         
-        # Metrics for logging
+        # Clear computation graph
+        del ratio, clipped_ratio, advantages, returns, new_log_probs, old_log_probs
+        
+        # Metrics for logging (convert to Python scalars to free tensors)
         metrics = {
             'ppo_loss': total_loss.item(),
             'policy_loss': policy_loss.item(),
             'value_loss': value_loss.item(),
             'entropy': new_entropies.mean().item(),
-            'avg_reward': rewards.mean().item(),
+            'avg_reward': rollout_data['rewards'].mean().item(),
             'validity_rate': rollout_data['reward_components']['validity'].mean().item(),
             'avg_qed': rollout_data['reward_components']['qed'].mean().item(),
             'avg_sa': rollout_data['reward_components']['sa'].mean().item()
         }
+        
+        # Clean up
+        del sequences, new_values, new_entropies, hidden_states, outputs
+        torch.cuda.empty_cache()
         
         return total_loss, metrics
 

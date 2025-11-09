@@ -1,0 +1,10 @@
+1: CCN(CC)CCO
+2: O=C(NC1CCOCC1)c2ccccc2
+3: Clc1ccccc1OCCN
+4: CN(C)CCOC(=O)c1ccc(Cl)cc1
+5: CC(C)NCC(O)CO
+6: CCOc1ccc(Cl)cc1N
+7: CN1CCCC1C(=O)O
+8: O=C(NCCN)c1ccccc1
+9: CC(=O)Oc1ccccc1
+10: C1CCCCC1

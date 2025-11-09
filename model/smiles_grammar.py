@@ -61,30 +61,27 @@ class SMILESGrammarConstraints:
         self.pad_id = tokenizer.pad_token_id
         
     def _build_token_categories(self):
-        """Categorize all tokens in vocabulary for efficient constraint checking."""
+        """
+        Categorize tokens following OpenSMILES standard.
+        
+        CRITICAL: In SOTA tokenization, bracket atoms are COMPLETE units.
+        Individual [ and ] should NOT exist in vocabulary.
+        """
         
         # Initialize category sets
         self.atoms = set()              # Aliphatic atoms: C, N, O, S, P, etc.
         self.aromatic_atoms = set()     # Aromatic atoms: c, n, o, s, p
-        self.bracket_atoms = set()      # Bracketed atoms: [C@@H], [N+], etc.
+        self.bracket_atoms = set()      # Complete bracketed atoms: [C@@H], [N+], etc.
         self.bonds = set()              # Bond symbols: =, #, -
         self.stereo_symbols = set()     # Stereochemistry: /, \
         self.ring_digits = {}           # Ring closures: {digit: token_id}
         self.paren_open = None
         self.paren_close = None
-        self.bracket_open = None
-        self.bracket_close = None
         
-        # Simple aliphatic atoms (not in brackets)
+        # Token categories for SMILES
         simple_atoms = ['B', 'C', 'N', 'O', 'S', 'P', 'F', 'Cl', 'Br', 'I']
-        
-        # Aromatic atoms (lowercase)
         aromatic_atom_list = ['b', 'c', 'n', 'o', 's', 'p']
-        
-        # Bond symbols
         bond_symbols = ['=', '#', '-']
-        
-        # Stereochemistry symbols
         stereo_list = ['/', '\\']
         
         # Categorize tokens
@@ -93,17 +90,17 @@ class SMILESGrammarConstraints:
             if token in ['<PAD>', '<BOS>', '<EOS>', '<MASK>', '<UNK>']:
                 continue
             
+            # Complete bracketed atoms (highest priority)
+            if token.startswith('[') and token.endswith(']') and len(token) > 2:
+                self.bracket_atoms.add(token_id)
+            
             # Simple aliphatic atoms
-            if token in simple_atoms:
+            elif token in simple_atoms:
                 self.atoms.add(token_id)
             
             # Aromatic atoms
             elif token in aromatic_atom_list:
                 self.aromatic_atoms.add(token_id)
-            
-            # Bracketed atoms (anything starting with '[' and ending with ']')
-            elif token.startswith('[') and token.endswith(']') and len(token) > 2:
-                self.bracket_atoms.add(token_id)
             
             # Bond symbols
             elif token in bond_symbols:
@@ -129,11 +126,14 @@ class SMILESGrammarConstraints:
             elif token == ')':
                 self.paren_close = token_id
             
-            # Brackets
-            elif token == '[':
-                self.bracket_open = token_id
-            elif token == ']':
-                self.bracket_close = token_id
+        # Sanity check: Verify no individual brackets exist
+        if '[' in self.token_to_id or ']' in self.token_to_id:
+            raise ValueError(
+                "CRITICAL ERROR: Individual bracket tokens [ or ] found in vocabulary! "
+                "This will cause generation failures. "
+                "Brackets must only appear as part of complete bracket atoms like [NH3+]. "
+                "Please rebuild vocabulary with proper tokenization."
+            )
         
         # Combined atom set (all types that can appear as atoms)
         self.all_atoms = self.atoms | self.aromatic_atoms | self.bracket_atoms
@@ -191,40 +191,31 @@ class SMILESGrammarConstraints:
         """
         Parse sequence to extract current state for constraint checking.
         
+        With proper tokenization, bracket atoms are complete units, so we don't track
+        bracket balance (it's always balanced within the token itself).
+        
         Returns:
             Dictionary with state information:
-            - bracket_balance: int
             - paren_balance: int
             - open_rings: Dict[int, Tuple[int, bool]]  # {digit: (position, is_aromatic)}
             - aromatic_ring_depth: int
             - last_token_id: Optional[int]
             - last_token_type: TokenType
             - position: int
-            - inside_bracket: bool
+            - tokens_since_atom: int
         """
         state = {
-            'bracket_balance': 0,
             'paren_balance': 0,
             'open_rings': {},
             'aromatic_ring_depth': 0,
             'last_token_id': None,
             'last_token_type': TokenType.OTHER,
             'position': len(seq_list),
-            'inside_bracket': False,
-            'tokens_since_atom': 0,  # Track distance from last atom
+            'tokens_since_atom': 0,
         }
         
         for i, token_id in enumerate(seq_list):
             token = self.id_to_token.get(token_id, '')
-            
-            # Track brackets
-            if token_id == self.bracket_open:
-                state['bracket_balance'] += 1
-                state['inside_bracket'] = True
-            elif token_id == self.bracket_close:
-                state['bracket_balance'] -= 1
-                if state['bracket_balance'] == 0:
-                    state['inside_bracket'] = False
             
             # Track parentheses
             if token_id == self.paren_open:
@@ -276,18 +267,16 @@ class SMILESGrammarConstraints:
         
         # Position 0 (after BOS, empty sequence)
         if state['position'] == 0:
-            # Only allow atoms and bracket open at start
-            allowed_at_start = self.atoms | self.aromatic_atoms | {self.bracket_open}
+            # Only allow atoms at start (simple, aromatic, or complete bracket atoms)
+            allowed_at_start = self.atoms | self.aromatic_atoms | self.bracket_atoms
             valid_tokens &= allowed_at_start
             
-            # Explicitly block bonds, stereo, closures at start
+            # Explicitly block bonds, stereo, closures, closing parens at start
             valid_tokens -= self.bonds
             valid_tokens -= self.stereo_symbols
             valid_tokens -= set(self.ring_digits.values())
             if self.paren_close:
                 valid_tokens.discard(self.paren_close)
-            if self.bracket_close:
-                valid_tokens.discard(self.bracket_close)
         
         return valid_tokens
     
@@ -393,21 +382,15 @@ class SMILESGrammarConstraints:
     
     def _apply_bracket_constraints(self, valid_tokens: Set[int], state: Dict) -> Set[int]:
         """
-        Apply bracket balance constraints.
+        Apply bracket constraints.
         
-        Rules:
-        1. Don't close bracket if not open
-        2. Don't allow empty brackets []
+        With proper tokenization, bracket atoms are complete units (e.g., [NH3+]),
+        so there are no bracket balance rules needed. Brackets are always balanced
+        within the token itself.
+        
+        This method is kept for compatibility but does nothing.
         """
-        
-        # Don't close bracket if balance is 0
-        if state['bracket_balance'] <= 0 and self.bracket_close:
-            valid_tokens.discard(self.bracket_close)
-        
-        # Don't allow ] immediately after [
-        if state['last_token_id'] == self.bracket_open and self.bracket_close:
-            valid_tokens.discard(self.bracket_close)
-        
+        # No constraints needed - bracket atoms are self-contained
         return valid_tokens
     
     def _apply_parenthesis_constraints(self, valid_tokens: Set[int], state: Dict, seq_list: List[int]) -> Set[int]:

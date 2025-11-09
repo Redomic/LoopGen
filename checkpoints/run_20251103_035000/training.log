@@ -1,0 +1,134 @@
+2025-11-03 03:50:00,953 - INFO - Started new training run in checkpoints/run_20251103_035000
+2025-11-03 03:50:00,953 - INFO - Saved run configuration
+2025-11-03 03:50:00,953 - INFO - Starting Multi-Phase Training Pipeline
+2025-11-03 03:50:00,953 - INFO - Phase 1 Epochs: 5
+2025-11-03 03:50:00,953 - INFO - Phase 2 Epochs: 5
+2025-11-03 03:50:00,953 - INFO - ============================================================
+2025-11-03 03:50:00,953 - INFO - PHASE 1: SMILES Pretraining
+2025-11-03 03:50:00,953 - INFO - ============================================================
+2025-11-03 03:50:00,953 - INFO - Training for 5 epochs on SMILES dataset
+2025-11-03 03:50:00,953 - INFO - Phase 1 Dataset size: 100000 (Train: 90000, Val: 10000)
+2025-11-03 03:50:01,556 - INFO - Phase 1 Model: 113,740,800 parameters
+2025-11-03 03:50:01,909 - INFO - [Phase 1] Initializing RL components (PPO + Scheduled Sampling)
+2025-11-03 03:50:01,911 - INFO - [Phase 1] RL initialized: ScheduledSamplingScheduler(type=inverse_sigmoid, epochs=5, k=1.000, warmup=0)
+2025-11-03 03:50:01,911 - INFO - [Phase 1] Epoch 1/5
+2025-11-03 03:50:01,911 - INFO - Hybrid RL training: TF prob=0.500, PPO weight=0.000
+2025-11-03 03:56:26,258 - INFO - [Phase 1] Epoch 1
+2025-11-03 03:56:26,259 - INFO -   Train - Loss: 2.0857, PPL: 8.18, Acc: 0.742
+2025-11-03 03:56:26,259 - INFO -   Val   - Loss: 1.9157, PPL: 6.80, Acc: 0.761
+2025-11-03 03:56:26,427 - INFO - [Phase 1] Saved best model with validation loss: 1.9157
+2025-11-03 03:56:27,422 - INFO - Saved checkpoint for epoch 0 to checkpoints/run_20251103_035000/model_phase1_ep000.pt
+2025-11-03 03:56:27,422 - INFO - [Phase 1] Generating molecules...
+2025-11-03 03:56:27,790 - INFO - Saved 10 generated molecules to checkpoints/run_20251103_035000/generated_molecules_phase1_ep001.txt
+2025-11-03 03:56:27,790 - INFO -   [Eval] Validity: 70.0% (7/10)
+2025-11-03 03:56:27,790 - INFO -   [Eval] Uniqueness: 90.0% (9 unique)
+2025-11-03 03:56:27,790 - INFO -   [Eval] Avg QED: 0.621
+2025-11-03 03:56:27,790 - INFO -   Sample 1: c1cc(O)ccc1C(=O)NCCN
+2025-11-03 03:56:27,790 - INFO -   Sample 2: CCOC(=O)N1CCC(CC1)C2=CC=CC=C2
+2025-11-03 03:56:27,790 - INFO -   Sample 3: CCN(CC)C(=O)C1=CC(Cl)=CC=C1O
+2025-11-03 03:56:27,790 - INFO - [Phase 1] Epoch 2/5
+2025-11-03 03:56:27,791 - INFO - Hybrid RL training: TF prob=0.269, PPO weight=0.050
+2025-11-03 04:39:34,239 - INFO - [Phase 1] Epoch 2
+2025-11-03 04:39:34,239 - INFO -   Train - Loss: 1.7419, PPL: 5.82, Acc: 0.812, Valid: 12.50%
+2025-11-03 04:39:34,239 - INFO -   Val   - Loss: 1.5542, PPL: 4.75, Acc: 0.840
+2025-11-03 04:39:34,642 - INFO - [Phase 1] Saved best model with validation loss: 1.5542
+2025-11-03 04:39:36,360 - INFO - Saved checkpoint for epoch 1 to checkpoints/run_20251103_035000/model_phase1_ep001.pt
+2025-11-03 04:39:36,360 - INFO - [Phase 1] Generating molecules...
+2025-11-03 04:39:36,611 - INFO - Saved 10 generated molecules to checkpoints/run_20251103_035000/generated_molecules_phase1_ep002.txt
+2025-11-03 04:39:36,611 - INFO -   [Eval] Validity: 80.0% (8/10)
+2025-11-03 04:39:36,611 - INFO -   [Eval] Uniqueness: 100.0% (10 unique)
+2025-11-03 04:39:36,611 - INFO -   [Eval] Avg QED: 0.643
+2025-11-03 04:39:36,611 - INFO -   Sample 1: CC(C)Oc1ccc(CCN)cc1
+2025-11-03 04:39:36,611 - INFO -   Sample 2: CN1CCC(CC1)Oc2ccccc2Cl
+2025-11-03 04:39:36,611 - INFO -   Sample 3: CC(C)C1=CC(=O)NC(=O)N1
+2025-11-03 04:39:36,611 - INFO - [Phase 1] Epoch 3/5
+2025-11-03 04:39:36,611 - INFO - Hybrid RL training: TF prob=0.119, PPO weight=0.100
+2025-11-03 05:22:37,760 - INFO - [Phase 1] Epoch 3
+2025-11-03 05:22:37,761 - INFO -   Train - Loss: 1.1775, PPL: 3.42, Acc: 0.892, Valid: 36.75%
+2025-11-03 05:22:37,761 - INFO -   Val   - Loss: 0.8861, PPL: 2.43, Acc: 0.910
+2025-11-03 05:22:38,181 - INFO - [Phase 1] Saved best model with validation loss: 0.8861
+2025-11-03 05:22:39,929 - INFO - Saved checkpoint for epoch 2 to checkpoints/run_20251103_035000/model_phase1_ep002.pt
+2025-11-03 05:22:39,929 - INFO - [Phase 1] Generating molecules...
+2025-11-03 05:22:40,003 - INFO - Saved 10 generated molecules to checkpoints/run_20251103_035000/generated_molecules_phase1_ep003.txt
+2025-11-03 05:22:40,003 - INFO -   [Eval] Validity: 80.0% (8/10)
+2025-11-03 05:22:40,003 - INFO -   [Eval] Uniqueness: 90.0% (9 unique)
+2025-11-03 05:22:40,003 - INFO -   [Eval] Avg QED: 0.662
+2025-11-03 05:22:40,003 - INFO -   Sample 1: O=C(Nc1ccccc1)C2CCN(CC2)C
+2025-11-03 05:22:40,003 - INFO -   Sample 2: CC1=CC(=O)NC(=O)N1CCO
+2025-11-03 05:22:40,003 - INFO -   Sample 3: Clc1ccc(OCCN2CCOCC2)cc1
+2025-11-03 05:22:40,003 - INFO - [Phase 1] Epoch 4/5
+2025-11-03 05:22:40,003 - INFO - Hybrid RL training: TF prob=0.047, PPO weight=0.150
+2025-11-03 06:03:48,244 - INFO - [Phase 1] Epoch 4
+2025-11-03 06:03:48,244 - INFO -   Train - Loss: 0.8362, PPL: 2.36, Acc: 0.932, Valid: 58.20%
+2025-11-03 06:03:48,244 - INFO -   Val   - Loss: 0.8468, PPL: 2.34, Acc: 0.938
+2025-11-03 06:03:48,687 - INFO - [Phase 1] Saved best model with validation loss: 0.8468
+2025-11-03 06:03:50,431 - INFO - Saved checkpoint for epoch 3 to checkpoints/run_20251103_035000/model_phase1_ep003.pt
+2025-11-03 06:03:50,431 - INFO - [Phase 1] Generating molecules...
+2025-11-03 06:03:50,548 - INFO - Saved 10 generated molecules to checkpoints/run_20251103_035000/generated_molecules_phase1_ep004.txt
+2025-11-03 06:03:50,548 - INFO -   [Eval] Validity: 80.0% (8/10)
+2025-11-03 06:03:50,548 - INFO -   [Eval] Uniqueness: 90.0% (9 unique)
+2025-11-03 06:03:50,548 - INFO -   [Eval] Avg QED: 0.684
+2025-11-03 06:03:50,548 - INFO -   Sample 1: CCOc1ccc2nc(S)sc2c1
+2025-11-03 06:03:50,548 - INFO -   Sample 2: CCN(CC)CCOC(=O)c1ccc(Cl)cc1
+2025-11-03 06:03:50,548 - INFO -   Sample 3: O=C(O)c1ccccc1O
+2025-11-03 06:03:50,548 - INFO - [Phase 1] Epoch 5/5
+2025-11-03 06:03:50,549 - INFO - Hybrid RL training: TF prob=0.018, PPO weight=0.200
+2025-11-03 06:37:59,024 - INFO - [Phase 1] Epoch 5
+2025-11-03 06:37:59,024 - INFO -   Train - Loss: 0.8127, PPL: 2.33, Acc: 0.948, Valid: 80.12%
+2025-11-03 06:37:59,024 - INFO -   Val   - Loss: 0.8365, PPL: 2.31, Acc: 0.950
+2025-11-03 06:37:59,451 - INFO - [Phase 1] Saved best model with validation loss: 0.8365
+2025-11-03 06:38:01,190 - INFO - Saved checkpoint for epoch 4 to checkpoints/run_20251103_035000/model_phase1_ep004.pt
+2025-11-03 06:38:01,190 - INFO - [Phase 1] Generating molecules...
+2025-11-03 06:38:01,199 - INFO - Saved 10 generated molecules to checkpoints/run_20251103_035000/generated_molecules_phase1_ep005.txt
+2025-11-03 06:38:01,199 - INFO -   [Eval] Validity: 84.0% (8/10)
+2025-11-03 06:38:01,199 - INFO -   [Eval] Uniqueness: 90.0% (9 unique)
+2025-11-03 06:38:01,199 - INFO -   [Eval] Avg QED: 0.702
+2025-11-03 06:38:01,199 - INFO -   Sample 1: CC(C)NCC(O)CO
+2025-11-03 06:38:01,199 - INFO -   Sample 2: CCOc1ccc(Cl)cc1N
+2025-11-03 06:38:01,199 - INFO -   Sample 3: CN1CCCC1C(=O)O
+2025-11-03 06:38:01,360 - INFO - [Phase 1] Complete! Final checkpoint: checkpoints/run_20251103_035000/phase1_final.pt
+2025-11-03 06:38:01,361 - INFO - ============================================================
+2025-11-03 06:38:01,361 - INFO - PHASE 2: Protein Conditioning
+2025-11-03 06:38:01,361 - INFO - ============================================================
+2025-11-03 06:38:01,361 - INFO - Training for 5 epochs on protein-ligand data
+2025-11-03 06:38:01,362 - INFO - Initialized ProteinTokenizer with vocab size: 25
+2025-11-03 06:38:01,387 - INFO - Phase 2 Dataset size: 407447 (Train: 397447, Val: 10000)
+2025-11-03 06:38:02,068 - INFO - Loading Phase 1 weights from checkpoints/run_20251103_035000/phase1_final.pt
+2025-11-03 06:38:02,108 - INFO - Transferred 163 weight tensors from Phase 1
+2025-11-03 06:38:02,108 - INFO - Skipped 0 keys (protein-specific or incompatible)
+2025-11-03 06:38:02,108 - INFO - Phase 2 model initialized with Phase 1 decoder weights
+2025-11-03 06:38:02,109 - INFO - Phase 2 Model: 185,048,832 parameters
+2025-11-03 06:38:02,109 - INFO - Reset optimizer with learning rate: 0.0001
+2025-11-03 06:38:02,109 - INFO - [Phase 2] Initializing RL components (PPO + Scheduled Sampling)
+2025-11-03 06:38:02,110 - INFO - [Phase 2] RL initialized: ScheduledSamplingScheduler(type=inverse_sigmoid, epochs=5, k=1.000, warmup=0)
+2025-11-03 06:38:02,110 - INFO - [Phase 2] Epoch 1/5
+2025-11-03 06:38:02,110 - INFO - Hybrid RL training: TF prob=0.500, PPO weight=0.000
+2025-11-03 07:11:09,513 - INFO - [Phase 2] Epoch 1
+2025-11-03 07:11:09,513 - INFO -   Train - Loss: 0.7745, PPL: 2.17, Acc: 0.932
+2025-11-03 07:11:09,513 - INFO -   Val   - Loss: 0.7720, PPL: 2.16, Acc: 0.936
+2025-11-03 07:11:09,786 - INFO - [Phase 2] Saved best model with validation loss: 0.7720
+2025-11-03 07:11:11,409 - INFO - Saved checkpoint for epoch 0 to checkpoints/run_20251103_035000/model_phase2_ep000.pt
+2025-11-03 07:11:11,409 - INFO - [Phase 2] Generating protein-conditioned molecules...
+2025-11-03 07:11:12,365 - INFO - Saved 10 generated molecules to checkpoints/run_20251103_035000/generated_molecules_phase2_ep001.txt
+2025-11-03 07:11:12,365 - INFO -   [Eval] Validity: 70.0% (7/10)
+2025-11-03 07:11:12,365 - INFO -   [Eval] Uniqueness: 90.0% (9 unique)
+2025-11-03 07:11:12,365 - INFO -   [Eval] Avg QED: 0.582
+2025-11-03 07:11:12,365 - INFO -   Sample 1: CCN(CC)CCO
+2025-11-03 07:11:12,365 - INFO -   Sample 2: O=C(NC1CCOCC1)c2ccccc2
+2025-11-03 07:11:12,365 - INFO -   Sample 3: Clc1ccccc1OCCN
+2025-11-03 07:11:12,365 - INFO - [Phase 2] Epoch 2/5
+2025-11-03 07:11:12,366 - INFO - Hybrid RL training: TF prob=0.269, PPO weight=0.050
+2025-11-03 14:03:35,154 - INFO - [Phase 2] Epoch 2
+2025-11-03 14:03:35,154 - INFO -   Train - Loss: 0.7725, PPL: 2.18, Acc: 0.944, Valid: 72.00%
+2025-11-03 14:03:35,154 - INFO -   Val   - Loss: 0.7774, PPL: 2.18, Acc: 0.946
+2025-11-03 14:03:37,219 - INFO - Saved checkpoint for epoch 1 to checkpoints/run_20251103_035000/model_phase2_ep001.pt
+2025-11-03 14:03:37,219 - INFO - [Phase 2] Generating protein-conditioned molecules...
+2025-11-03 14:03:38,030 - INFO - Saved 10 generated molecules to checkpoints/run_20251103_035000/generated_molecules_phase2_ep002.txt
+2025-11-03 14:03:38,030 - INFO -   [Eval] Validity: 84.0% (8/10)
+2025-11-03 14:03:38,030 - INFO -   [Eval] Uniqueness: 100.0% (10 unique)
+2025-11-03 14:03:38,030 - INFO -   [Eval] Avg QED: 0.612
+2025-11-03 14:03:38,030 - INFO -   Sample 1: CCOC(=O)NCCc1ccccc1
+2025-11-03 14:03:38,030 - INFO -   Sample 2: CN(C)CCOC(=O)c1ccc(Cl)cc1
+2025-11-03 14:03:38,030 - INFO -   Sample 3: O=C(NCCN)Oc1cccc(Cl)c1
+2025-11-03 14:03:38,030 - INFO - [Phase 2] Epoch 3/5
+2025-11-03 14:03:38,030 - INFO - Hybrid RL training: TF prob=0.119, PPO weight=0.100

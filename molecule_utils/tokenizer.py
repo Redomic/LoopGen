@@ -246,25 +246,30 @@ class SMILESTokenizer:
         return vocabulary
     
     def _get_default_vocabulary(self) -> List[str]:
-        """Get default atom-level SMILES vocabulary (curated for drug-like molecules)."""
-        print("Using curated minimal atom-level SMILES vocabulary")
+        """
+        Get default SMILES vocabulary following OpenSMILES standard.
+        
+        CRITICAL: Bracket atoms are COMPLETE units. Individual [ and ] are NOT included.
+        This ensures consistency with tokenization and prevents grammar conflicts.
+        """
+        print("Building SOTA SMILES vocabulary (OpenSMILES standard)")
         
         # Drug-like organic atoms (no metals, no exotic elements)
         organic_atoms = ['C', 'N', 'O', 'S', 'P', 'F', 'Cl', 'Br', 'I', 'B']
         aromatic_atoms = ['c', 'n', 'o', 's', 'p', 'b']
         
-        # Bonds (no reaction arrow '>')
+        # Bonds and stereochemistry
         bonds = ['=', '#', '-', '/', '\\']
         
-        # Structure tokens
-        structure = ['(', ')', '[', ']', '@', '@@']
+        # Structure tokens (parentheses only - NO individual brackets)
+        structure = ['(', ')', '@', '@@', '+']
         
-        # Ring numbers (0-9 for simple rings, %10-%15 for larger rings)
+        # Ring closures
         ring_numbers = [str(i) for i in range(10)]  # 0-9
         ring_closures = ['%10', '%11', '%12', '%13', '%14', '%15']
         
-        # Common bracket atoms (chirality, charge, hydrogen count)
-        # Keep only common drug-like charged/modified atoms
+        # Complete bracket atoms (ALWAYS as single units)
+        # These include their own brackets - we NEVER tokenize [ or ] separately
         bracket_atoms = [
             # Nitrogen variants
             '[NH]', '[NH2]', '[NH3+]', '[NH+]', '[NH2+]', '[N+]', '[N-]', '[N@@+]', '[N@+]',
@@ -281,27 +286,27 @@ class SMILESTokenizer:
             '[C@H]', '[C@@H]', '[C@]', '[C@@]', '[CH]', '[CH2]', '[CH3]', '[C]',
             '[cH]',
             
-            # Phosphorus (common in drugs)
-            '[P@]', '[P@@]', '[PH]', '[P+]',
+            # Phosphorus
+            '[P@]', '[P@@]', '[PH]', '[P+]', '[P-]',
             
-            # Halogen brackets (sometimes needed)
+            # Halogens (when in brackets)
             '[Cl]', '[F]', '[Br]', '[I]',
             
-            # Boron (emerging in drug design)
+            # Boron
             '[B-]', '[BH]', '[B]',
         ]
         
-        # Combine all tokens (NO reaction arrows, NO metals, NO dots for fragments)
-        # We intentionally exclude '.' to discourage multi-fragment generation
-        # We intentionally exclude '>' and other reaction tokens
+        # Combine tokens
+        # CRITICAL: NO individual [ or ] tokens!
         smiles_tokens = (
             organic_atoms + aromatic_atoms + bonds + structure + 
             ring_numbers + ring_closures + bracket_atoms
         )
         
         vocabulary = self.special_tokens + sorted(set(smiles_tokens))
-        print(f"Curated vocabulary size: {len(vocabulary)}")
-        print("Excluded: reaction tokens (>), metals, fragment separator (.)")
+        print(f"Vocabulary size: {len(vocabulary)}")
+        print("✓ Bracket atoms are complete units (no individual [ or ])")
+        print("✓ Excluded: reaction tokens, metals, fragment separator")
         return vocabulary
 
     def _load_vocabulary(self, vocab_path: str) -> List[str]:
@@ -344,21 +349,42 @@ class SMILESTokenizer:
         print(f"Vocabulary saved to {save_path}")
 
     def _atomwise_tokenize(self, smiles: str) -> List[str]:
-        """Atom-level tokenization fallback using SmilesPE or regex (curated for drug-like SMILES)."""
-        if SMILES_PE_AVAILABLE:
-            try:
-                tokens = atomwise_tokenizer(smiles)
-                # Filter out reaction arrows and exotic tokens
-                return [t for t in tokens if t not in ['>', '.', '~', '?', '*', '$']]
-            except:
-                pass
+        """
+        Standard SMILES tokenization using regex pattern from OpenSMILES specification.
         
-        # Regex fallback (drug-like SMILES only - no reaction arrows, no fragment separator)
+        This is the SOTA approach used in molecular generation systems:
+        - Bracket atoms are ALWAYS complete units: [NH3+], [C@@H], etc.
+        - Never tokenize individual [ or ] separately
+        - Ensures consistency between training and generation
+        
+        Pattern breakdown:
+        - \[[^\]]+\] : Complete bracketed atoms (highest priority)
+        - Br?|Cl?   : Two-letter atoms (Br, Cl) 
+        - Single atoms, bonds, structure tokens
+        
+        Reference: OpenSMILES specification, used in MolGPT, REINVENT, etc.
+        """
         import re
-        # Removed: '>' (reaction), '~', '?', '*', '$', ':' (exotic bonds/markers)
-        # Kept: '.' for now but discouraged in vocab
-        pattern = r"""(\[[^\]]+\]|Br?|Cl?|N|O|S|P|F|I|B|b|c|n|o|s|p|\(|\)|=|#|-|\+|\\|\/|@|\%[0-9]{2}|[0-9])"""
-        return re.findall(pattern, smiles)
+        
+        # Standard SMILES tokenization regex (bracket atoms as complete units)
+        # This pattern ensures [ and ] are NEVER individual tokens
+        pattern = r"""(
+            \[[^\]]+\]|          # Bracketed atoms (complete unit) - HIGHEST PRIORITY
+            Br?|Cl?|             # Two-letter atoms
+            [BCNOPSFIbcnops]|    # Single-letter atoms
+            \(|\)|               # Parentheses for branches
+            =|\#|-|\\|\/|        # Bonds and stereochemistry
+            %[0-9]{2}|           # Two-digit ring closures (%10-%99)
+            [0-9]|               # Single-digit ring closures
+            @@?|\+               # Chirality and charge (outside brackets)
+        )"""
+        
+        tokens = re.findall(pattern, smiles, re.VERBOSE)
+        
+        # Filter out unwanted tokens (fragments, reactions, exotic symbols)
+        filtered_tokens = [t for t in tokens if t not in ['.', '>', '~', '?', '*', '$', ':']]
+        
+        return filtered_tokens
 
     @property
     def vocab_size(self) -> int:
