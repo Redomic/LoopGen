@@ -1,0 +1,11 @@
+2025-11-09 13:33:01,147 - INFO - ======================================================================
+2025-11-09 13:33:01,147 - INFO - Protein-Conditioned Molecular Generation (Demo)
+2025-11-09 13:33:01,147 - INFO - ======================================================================
+2025-11-09 13:33:01,147 - INFO - Protein sequence: MKTAYIAKQRQISFVKSHFSRQLE
+2025-11-09 13:33:01,147 - INFO - Number of samples: 20
+2025-11-09 13:33:01,147 - INFO - 
+2025-11-09 13:33:01,147 - INFO - Generating 20 drug-like molecules...
+2025-11-09 13:33:01,157 - INFO - 
+Saved molecules to: generated_molecules.txt
+2025-11-09 13:33:01,157 - INFO - Generation complete!
+2025-11-09 13:33:01,157 - INFO - Log file saved to: generation.log
